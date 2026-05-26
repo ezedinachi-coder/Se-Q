@@ -35,6 +35,7 @@ const withMapboxToken = (config) => {
 
 module.exports = {
   expo: {
+  owner: "ae1982",
     name: "Se-Q",
     slug: "se-q",
     version: "2.1.9",
