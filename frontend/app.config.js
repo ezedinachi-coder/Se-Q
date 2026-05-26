@@ -77,7 +77,7 @@ module.exports = {
     },
     extra: {
       eas: {
-        projectId: "a4513a14-613a-4f0c-b4e1-2987e9f619f4"
+        projectId: "20b077ed-ef31-4522-8f6e-be1dbd9eaa73"
       },
       backendUrl: "https://se-q-production.up.railway.app",
       mapboxAccessToken: MAPBOX_TOKEN,
