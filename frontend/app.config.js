@@ -1,4 +1,3 @@
-cat > app.config.js << 'EOF'
 require('dotenv').config();
 
 const { withStringsXml } = require("expo/config-plugins");
@@ -86,4 +85,3 @@ module.exports = {
     plugins: [withMapboxToken]
   }
 };
-EOF
