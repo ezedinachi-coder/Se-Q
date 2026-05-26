@@ -1,0 +1,40 @@
+{
+  "cli": {
+    "version": ">= 7.0.0"
+  },
+  "build": {
+    "production": {
+      "node": "20.19.4",
+      "android": {
+        "buildType": "apk"
+      },
+      "env": {
+        "MAPBOX_ACCESS_TOKEN": "@env:MAPBOX_ACCESS_TOKEN",
+        "NODE_NO_WARNINGS": "1"
+      }
+    },
+    "preview": {
+      "node": "20.19.4",
+      "android": {
+        "buildType": "apk"
+      },
+      "distribution": "internal",
+      "env": {
+        "MAPBOX_ACCESS_TOKEN": "@env:MAPBOX_ACCESS_TOKEN",
+        "NODE_NO_WARNINGS": "1"
+      }
+    },
+    "development": {
+      "node": "20.19.4",
+      "developmentClient": true,
+      "distribution": "internal",
+      "env": {
+        "MAPBOX_ACCESS_TOKEN": "@env:MAPBOX_ACCESS_TOKEN",
+        "NODE_NO_WARNINGS": "1"
+      }
+    }
+  },
+  "submit": {
+    "production": {}
+  }
+}

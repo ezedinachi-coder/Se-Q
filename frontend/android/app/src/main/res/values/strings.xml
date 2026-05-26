@@ -1,0 +1,31 @@
+<resources>
+  <string name="app_name">Se-Q</string>
+  <string name="expo_system_ui_user_interface_style" translatable="false">dark</string>
+  <string name="expo_splash_screen_resize_mode" translatable="false">contain</string>
+
+  <!--
+    MAPBOX ACCESS TOKEN — REQUIRED for Team Location map (set-location.tsx) and
+    Nearby Security map view (nearby.tsx) to work on Android.
+
+    The Mapbox Maps Android SDK reads this string at native init time
+    (MapController.<init>) BEFORE any JavaScript runs. Calling
+    Mapbox.setAccessToken() from JS alone is NOT sufficient — the native layer
+    crashes with MapboxConfigurationException if this resource is absent or empty.
+
+    HOW TO SET IT (two options):
+
+    Option A — EAS Build (recommended for CI / production):
+      1. Add your token as an EAS secret:
+           eas secret create MAPBOX_ACCESS_TOKEN pk.eyJ1...your_token_here
+      2. The app.config.js withMapboxToken plugin (below) will write the resolved
+         value into this file automatically at build time via expo-build-properties.
+      3. You never commit the real token to git — leave this placeholder here.
+
+    Option B — Local / direct edit (for quick testing):
+      Replace PASTE_YOUR_MAPBOX_TOKEN_HERE below with your pk.eyJ1... token.
+      Find your token at https://account.mapbox.com/access-tokens/
+      DO NOT commit a real token to git — add strings.xml to .gitignore or use
+      a separate local override file.
+  -->
+  <string name="mapbox_access_token" translatable="false">PASTE_YOUR_MAPBOX_TOKEN_HERE</string>
+</resources>

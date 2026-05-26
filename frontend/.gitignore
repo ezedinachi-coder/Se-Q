@@ -1,0 +1,15 @@
+# Expo
+.expo/
+
+# Environment variables (prevent accidental commit)
+.env
+.env.local
+.env.production
+
+# Native projects (these contain injected tokens during build)
+/ios
+
+# OS files
+.DS_Store
+*.log
+node_modules/

@@ -1,0 +1,13 @@
+# nixpacks.toml — Railway build configuration
+# Installs ffmpeg so video transcoding works in production.
+# Without this Railway's default container has no ffmpeg and all
+# video uploads skip compression, storing enormous raw files.
+
+[phases.setup]
+nixPkgs = ["ffmpeg", "ffprobe"]
+
+[phases.install]
+cmds = ["pip install -r requirements.txt"]
+
+[start]
+cmd = "uvicorn server:app --host 0.0.0.0 --port $PORT --timeout-keep-alive 300"

@@ -1,0 +1,65 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.seq.app">
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION"/>
+    <uses-permission android:name="android.permission.CAMERA"/>
+    <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+    <uses-permission android:name="android.permission.SEND_SMS"/>
+    <uses-permission android:name="android.permission.READ_PHONE_STATE"/>
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+    <uses-permission android:name="android.permission.VIBRATE"/>
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_HEALTH"/>
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
+    <!-- Required for posting heads-up notifications on Android 13+ -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <!-- Required for USE_FULL_SCREEN_INTENT (panic heads-up on locked screen) -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT"/>
+
+    <application android:name=".MainApplication" android:label="@string/app_name" android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher_round" android:allowBackup="true" android:theme="@style/AppTheme" android:usesCleartextTraffic="true">
+        <activity android:name=".MainActivity" android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout|uiMode" android:launchMode="singleTask" android:windowSoftInputMode="adjustResize" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity>
+
+        <!-- Shake detection foreground service — health type covers motion/accelerometer -->
+        <service
+            android:name=".ShakeDetectionService"
+            android:exported="false"
+            android:foregroundServiceType="health"/>
+
+        <!-- Boot restart service — restores shake detection after reboot -->
+        <service
+            android:name=".BootRestartService"
+            android:exported="false"
+            android:foregroundServiceType="health"/>
+
+        <!-- Handles Cancel tap on the shake heads-up notification -->
+        <receiver
+            android:name=".PanicDismissReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.seq.app.PANIC_DISMISS"/>
+            </intent-filter>
+        </receiver>
+
+        <!-- Starts both services after device reboot -->
+        <receiver android:name=".BootReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED"/>
+                <action android:name="android.intent.action.QUICKBOOT_POWERON"/>
+            </intent-filter>
+        </receiver>
+
+        <!-- Receives broadcast-based panic triggers -->
+        <receiver android:name=".PanicReceiver" android:exported="false">
+            <intent-filter>
+                <action android:name="SEQ_PANIC_TRIGGERED"/>
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

@@ -1,0 +1,21 @@
+﻿# Environment variables
+.env
+.env.local
+.env.production
+
+# Node
+node_modules/
+
+# Build outputs
+dist/
+build/
+*.apk
+*.aab
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
