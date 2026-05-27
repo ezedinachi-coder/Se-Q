@@ -4,7 +4,6 @@ import { View, Text, TouchableOpacity, StyleSheet, ScrollView, Alert, TextInput,
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter, useFocusEffect } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
-import { Audio } from 'expo-av';
 import axios from 'axios';
 import { getAuthToken, clearAuthData, getUserMetadata } from '../../utils/auth';
 import BACKEND_URL from '../../utils/config';
@@ -90,11 +89,6 @@ export default function SecurityHome() {
     } catch (_) {}
   };
 
-  // msgSoundRef no longer needed — AudioManager tracks the sound internally.
-  // Cleanup on unmount: AudioManager.stopAll() is called via clearAuthData()
-  // on logout, so no local cleanup needed here for the message alert.
-  // The alarm (alarmRef) still has its own unmount cleanup below.
-
   // ── Panic alarm ──────────────────────────────────────────────────────────
   //
   // Design rules (leak-free):
@@ -115,14 +109,21 @@ export default function SecurityHome() {
   //
   // 4. A new panic (count increase) overrides any prior silence so the agent
   //    cannot miss a fresh emergency.
-
-  const alarmRef          = useRef<Audio.Sound | null>(null);
+  //
+  // FIX SOUND-CLASH Bug-02: startAlarm() used to call requestFocus() then
+  // create Audio.Sound directly outside AudioManager, leaving activeSound
+  // null. stopAlarm() then called releaseFocus() which did nothing because
+  // the guard this.activeSound && this.activeSound.tag === tag was false —
+  // audio mode was never restored to standby and currentPriority stayed ALERT.
+  //
+  // FIX: ALL alarm lifecycle goes through AudioManager.playSound() /
+  // AudioManager.releaseFocus(). AudioManager owns the sound reference,
+  // activeSound.tag is tracked, and releaseFocus() works correctly.
   const [alarmOn, setAlarmOn] = useState(false);
   const alarmSilencedRef  = useRef(false);
   const lastPanicCountRef = useRef(0);
   const nearbyPanicsRef   = useRef<any[]>([]);
   const isFocusedRef      = useRef(false); // true only while this screen has nav focus
-  // msgSoundRef removed — AudioManager owns message alert sound lifecycle.
   const prevUnreadRef     = useRef(0);
 
   // Keep ref in sync for closure-safe reads
@@ -131,58 +132,33 @@ export default function SecurityHome() {
   }, [nearbyPanics]);
 
   const startAlarm = async () => {
-    if (alarmRef.current) return; // already playing
+    // FIX SOUND-CLASH Bug-02: Delegate the ENTIRE alarm lifecycle to
+    // AudioManager.playSound(). This keeps activeSound, currentPriority,
+    // and the audio mode in sync. We never touch Audio.Sound directly
+    // here — it is an implementation detail AudioManager manages.
     try {
-      // FIX SOUND-CLASH: request focus through AudioManager so the singleton
-      // tracks this mode change and can clean it up on logout/role-switch.
-      await AudioManager.requestFocus(AudioPriority.ALERT, 'security_alarm');
-
-      // FIX: Added downloadFirst:true — without it, CDNs that serve audio with
-      // streaming headers (Content-Type: audio/mpeg; Transfer-Encoding: chunked)
-      // cause createAsync to resolve with isLoaded:false and the alarm never
-      // plays. downloadFirst buffers the file locally before starting playback.
-      //
-      // FIX: Replaced broken inline .catch() fallback — the original pattern
-      // destructured { sound } from the outer await but the .catch() branch
-      // returned a new Promise; if the primary URL failed mid-await, { sound }
-      // was undefined and alarmRef.current was set to undefined, crashing the
-      // next stopAsync() call. Explicit try/catch with a named fallback is safe.
-      let sound: Audio.Sound;
-      try {
-        ({ sound } = await Audio.Sound.createAsync(
-          { uri: 'https://assets.mixkit.co/active_storage/sfx/212/212-preview.mp3', downloadFirst: true },
-          { isLooping: true, volume: 1.0, shouldPlay: true }
-        ));
-      } catch (_primary) {
-        // Primary URL failed — try fallback before giving up
-        ({ sound } = await Audio.Sound.createAsync(
-          { uri: 'https://assets.mixkit.co/active_storage/sfx/951/951-preview.mp3', downloadFirst: true },
-          { isLooping: true, volume: 1.0, shouldPlay: true }
-        ));
+      const sound = await AudioManager.playSound(
+        'https://assets.mixkit.co/active_storage/sfx/212/212-preview.mp3',
+        AudioPriority.ALERT,
+        'security_alarm',
+        { isLooping: true, volume: 1.0, downloadFirst: true }
+      );
+      if (sound) {
+        setAlarmOn(true);
+        console.log('[SecurityHome] Alarm started via AudioManager');
       }
-      alarmRef.current = sound;
-      setAlarmOn(true);
     } catch (err) {
       console.warn('[SecurityHome] Could not start panic alarm:', err);
     }
   };
 
   const stopAlarm = async () => {
-    if (alarmRef.current) {
-      // FIX: Synchronously suppress audio BEFORE any await.
-      // stopAsync/unloadAsync are async — without this instant mute the sound
-      // continues playing for 100-300 ms while those Promises resolve, bleeding
-      // audibly into the next screen during navigation transitions.
-      alarmRef.current.setStatusAsync({ shouldPlay: false }).catch(() => {});
-      setAlarmOn(false); // update UI immediately, not after async cleanup
-      try { await alarmRef.current.stopAsync(); } catch (_) {}
-      try { await alarmRef.current.unloadAsync(); } catch (_) {}
-      alarmRef.current = null;
-    }
-    // FIX SOUND-CLASH: release focus through AudioManager so the singleton
-    // restores standby mode in a coordinated way that survives role-switches.
+    // FIX SOUND-CLASH Bug-02: Now that startAlarm() delegates to
+    // AudioManager.playSound(), the sound is stored in activeSound with
+    // tag='security_alarm'. releaseFocus() will find it, stop it, unload it,
+    // restore standby mode, and clear currentPriority — all correctly.
     await AudioManager.releaseFocus('security_alarm');
-    setAlarmOn(false); // idempotent — ensures UI in sync after full async chain
+    setAlarmOn(false);
   };
 
   const silenceAlarm = async () => {
