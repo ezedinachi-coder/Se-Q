@@ -80,6 +80,32 @@ class SeqPanicModule(reactContext: ReactApplicationContext) :
         }
     }
 
+    // ── Stop ShakeDetectionService ─────────────────────────────────────────────
+    // Called when a non-civil role logs in (admin / security).
+    // Also clears any stale pending-panic flag so a previously running service
+    // cannot leave ghost state that affects the next session.
+
+    @ReactMethod
+    fun stopShakeService(promise: Promise) {
+        try {
+            val ctx    = reactApplicationContext
+            val intent = Intent(ctx, ShakeDetectionService::class.java)
+            ctx.stopService(intent)
+
+            // Clear any stale panic flags the service may have written
+            ctx.getSharedPreferences(ShakeDetectionService.PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .remove(ShakeDetectionService.PREFS_KEY_PENDING)
+                .apply()
+
+            Log.d(TAG, "ShakeDetectionService stopped from JS")
+            promise.resolve(true)
+        } catch (e: Exception) {
+            Log.e(TAG, "stopShakeService error: ${e.message}")
+            promise.resolve(false)
+        }
+    }
+
     // ── Check if battery optimization is already disabled ─────────────────────
 
     @ReactMethod
