@@ -313,12 +313,24 @@ class AudioManagerClass {
 
   /**
    * Emergency stop — stops everything regardless of priority.
+   *
+   * FIX SOUND-CLASH Bug-03: Previous version nulled currentPriority ONLY inside
+   * the activeSound block. When activeSound was null (e.g. after Bug-02's
+   * mixed-ownership scenario where AudioManager held the focus but not the
+   * sound reference), stopAll() never cleared currentPriority — leaving the
+   * singleton stuck at ALERT mode even after stopAll() was called.
+   *
+   * FIX: Null currentPriority UNCONDITIONALLY at the top of the function,
+   * before checking activeSound. This ensures the state is clean regardless
+   * of whether there is a managed sound or not.
    */
   async stopAll(): Promise<void> {
+    // Always reset priority first — even if activeSound is null
+    this.currentPriority = null;
+
     if (this.activeSound) {
       const snapshot = this.activeSound;
       this.activeSound = null;
-      this.currentPriority = null;
       try {
         await snapshot.sound.setStatusAsync({ shouldPlay: false }).catch(() => {});
         await snapshot.sound.stopAsync().catch(() => {});

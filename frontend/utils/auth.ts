@@ -15,7 +15,7 @@
  */
 
 import AsyncStorage from './asyncStorageShim';
-import { Audio } from 'expo-av';
+import { Audio, InterruptionModeAndroid, InterruptionModeIOS } from 'expo-av';
 
 const AUTH_TOKEN_KEY  = 'auth_token';
 const USER_ID_KEY     = 'user_id';
@@ -83,8 +83,9 @@ export const clearAuthData = async (): Promise<boolean> => {
         staysActiveInBackground: false,
         shouldDuckAndroid: true,
         playThroughEarpieceAndroid: false,
-        interruptionModeIOS: 0,
-        interruptionModeAndroid: 0,
+        // FIX: use proper enum values, never raw integer 0 (BUG-05)
+        interruptionModeIOS: InterruptionModeIOS.DoNotMix,
+        interruptionModeAndroid: InterruptionModeAndroid.DoNotMix,
       });
       console.log('[Auth] Audio session reset on logout');
     } catch (_) {}
