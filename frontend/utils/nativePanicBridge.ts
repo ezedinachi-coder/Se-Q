@@ -51,6 +51,20 @@ export async function startShakeService(): Promise<boolean> {
   }
 }
 
+// ── stopShakeService ──────────────────────────────────────────────────────────
+// Call when a non-civil role is active (admin / security) to ensure the
+// ShakeDetectionService is not running and any stale SharedPrefs flags are cleared.
+
+export async function stopShakeService(): Promise<boolean> {
+  if (Platform.OS !== 'android' || !SeqPanic?.stopShakeService) return false;
+  try {
+    const result = await SeqPanic.stopShakeService();
+    return result === true;
+  } catch {
+    return false;
+  }
+}
+
 // ── isIgnoringBatteryOptimizations ────────────────────────────────────────────
 
 export async function isIgnoringBatteryOptimizations(): Promise<boolean> {
