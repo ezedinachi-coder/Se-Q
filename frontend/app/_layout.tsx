@@ -18,6 +18,7 @@ import {
 import {
   checkAndConsumePanic,
   startShakeService,
+  stopShakeService,
   isIgnoringBatteryOptimizations,
   requestIgnoreBatteryOptimizations,
   requestPostNotificationsPermission,
@@ -119,20 +120,37 @@ function AppContent() {
     setBannerVisible(true);
     if (bannerTimerRef.current) clearTimeout(bannerTimerRef.current);
 
-    // Start tracking the timeout - if no action within 5s, auto-dismiss
+    // Start tracking the 5-second timeout. On expiry:
+    //  • hide the banner
+    //  • cross-cancel bannerTimerRef so it doesn't double-fire
+    //  • drain any native PREFS_KEY_PENDING flag the ShakeDetectionService
+    //    wrote simultaneously — prevents checkNativePanic from force-routing
+    //    to panic-shake when the user navigates after a dismissed shake.
     startShakeTimeout(() => {
-      // This runs on timeout - dismiss the banner
+      if (bannerTimerRef.current) {
+        clearTimeout(bannerTimerRef.current);
+        bannerTimerRef.current = null;
+      }
       setBannerVisible(false);
+      checkAndConsumePanic().catch(() => {}); // drain native flag silently
     });
 
-    // Also set the banner auto-dismiss timer for the in-app notification (5s)
-    bannerTimerRef.current = setTimeout(() => setBannerVisible(false), 5000);
+    // Backup timer — cross-cancelled by the startShakeTimeout callback above
+    // if that fires first; kept as a safety net in case of timer skew.
+    bannerTimerRef.current = setTimeout(() => {
+      bannerTimerRef.current = null;
+      setBannerVisible(false);
+      checkAndConsumePanic().catch(() => {}); // drain native flag silently
+    }, 5000);
   }, []);
 
   const handleBannerTap = useCallback(() => {
     // Cancel the timeout since user is taking action
     cancelShakeTimeout();
-    if (bannerTimerRef.current) clearTimeout(bannerTimerRef.current);
+    if (bannerTimerRef.current) {
+      clearTimeout(bannerTimerRef.current);
+      bannerTimerRef.current = null;
+    }
     setBannerVisible(false);
     try { router.push('/civil/panic-shake'); } catch (_) {}
   }, []);
@@ -140,8 +158,15 @@ function AppContent() {
   const handleBannerDismiss = useCallback(() => {
     // Cancel the timeout since user dismissed
     cancelShakeTimeout();
-    if (bannerTimerRef.current) clearTimeout(bannerTimerRef.current);
+    if (bannerTimerRef.current) {
+      clearTimeout(bannerTimerRef.current);
+      bannerTimerRef.current = null;
+    }
     setBannerVisible(false);
+    // Drain any native PREFS_KEY_PENDING the ShakeDetectionService wrote for
+    // this same physical shake — prevents checkNativePanic from seeing a
+    // stale flag and force-routing to panic-shake on the next navigation.
+    checkAndConsumePanic().catch(() => {});
   }, []);
 
   useEffect(() => () => {
@@ -179,20 +204,40 @@ function AppContent() {
     onTriggered:    handleShakeTrigger,
   });
 
-  // ── Start native ShakeDetectionService (civil users, Android only) ─────────
+  // ── Start / stop native ShakeDetectionService based on role ───────────────
+  // START_STICKY services keep running until explicitly stopped. Without the
+  // stop call, a civil user who logs out and hands the phone to an admin/security
+  // user would leave the service running — admin/security shakes would post the
+  // "Emergency Detected" heads-up notification and set PREFS_KEY_PENDING.
 
   useEffect(() => {
-    if (userRole !== 'civil' || serviceStarted.current || Platform.OS !== 'android') return;
-    serviceStarted.current = true;
+    if (Platform.OS !== 'android' || userRole === null) return;
 
-    (async () => {
-      try {
-        const started = await startShakeService();
-        console.log('[Layout] ShakeDetectionService started:', started);
-      } catch (e) {
-        console.warn('[Layout] Could not start ShakeDetectionService:', e);
-      }
-    })();
+    if (userRole === 'civil') {
+      if (serviceStarted.current) return; // already running
+      serviceStarted.current = true;
+      (async () => {
+        try {
+          const started = await startShakeService();
+          console.log('[Layout] ShakeDetectionService started:', started);
+        } catch (e) {
+          console.warn('[Layout] Could not start ShakeDetectionService:', e);
+        }
+      })();
+    } else {
+      // Admin / Security / any other role — ensure the service is stopped and
+      // any stale SharedPrefs flag is cleared (stopShakeService handles both).
+      if (!serviceStarted.current) return; // was never started, nothing to do
+      serviceStarted.current = false;
+      (async () => {
+        try {
+          await stopShakeService();
+          console.log('[Layout] ShakeDetectionService stopped for non-civil role:', userRole);
+        } catch (e) {
+          console.warn('[Layout] Could not stop ShakeDetectionService:', e);
+        }
+      })();
+    }
   }, [userRole]);
 
   // ── Android 13+ notification permission ───────────────────────────────────
