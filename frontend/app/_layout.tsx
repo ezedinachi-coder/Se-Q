@@ -32,6 +32,19 @@ import AsyncStorage from '../utils/asyncStorageShim';
 
 // ── In-app shake banner (shown only when app is foregrounded) ─────────────────
 
+/**
+ * FIX SOUND-CLASH Bug-01: AudioManager.cleanup()+initialize() only ran on
+ * component MOUNT, never on role change. The singleton carried stale state
+ * (currentPriority, isInitialized, OS mode) from the previous session into
+ * the next. A new security user logging in after a civil user left a sound
+ * stuck would inherit the stale state and the audio session would never
+ * restore to standby.
+ *
+ * This effect watches userRole changes. On every change (login, logout,
+ * role switch), it performs a full AudioManager teardown + re-init so the
+ * next session always starts from a guaranteed-clean state.
+ */
+
 interface ShakeBannerProps { onTap: () => void; onDismiss: () => void; }
 
 function ShakeBanner({ onTap, onDismiss }: ShakeBannerProps) {
@@ -203,6 +216,27 @@ function AppContent() {
     cooldownMs:     6000,
     onTriggered:    handleShakeTrigger,
   });
+
+  // ── AudioManager reset on role change ────────────────────────────────────
+  // FIX SOUND-CLASH Bug-01: Every time the user role changes (e.g. Security
+  // logs out, Admin takes over, Civil re-logs) we do a full teardown so no
+  // orphan sounds, stale currentPriority flag, or wrong OS audio mode bleeds
+  // into the next session.  This is the primary guard against the singleton
+  // carrying state across sessions.
+  useEffect(() => {
+    if (userRole === null) return; // not yet loaded from storage
+
+    const resetAudio = async () => {
+      try {
+        await AudioManager.cleanup();   // stops all, nulls activeSound + currentPriority
+        await AudioManager.initialize(); // re-applies STANDBY_MODE
+        console.log('[Layout] AudioManager reset complete for role:', userRole);
+      } catch (err) {
+        console.warn('[Layout] AudioManager reset failed on role change:', err);
+      }
+    };
+    resetAudio();
+  }, [userRole]);
 
   // ── Start / stop native ShakeDetectionService based on role ───────────────
   // START_STICKY services keep running until explicitly stopped. Without the
