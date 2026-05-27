@@ -1,25 +1,20 @@
 /**
- * civil/escort.tsx — Redesigned UI (v3)
+ * civil/escort.tsx — v4
  *
- * All logic/backend calls are identical to Phase 3 Patch v2.
- * Only the visual layer has been replaced with a modern tactical-grade UI:
- *   - expo-linear-gradient for depth and atmosphere
- *   - expo-blur for frosted-glass panels
- *   - react-native-reanimated for pulse rings, radar sweep, staggered entry
- *   - expo-haptics for tactile feedback on Start/Stop
- *
- * BUG FIXES (carried over from Patch v2):
- * 1. Session remembered after logout/re-login — backend is authoritative.
- * 2. GPS posting cadence fixed — single foreground interval, background task
- *    only when app is backgrounded.
- * 3. Admin escort-sessions shows full route — server writes to both fields.
+ * CHANGES vs v3:
+ * 1. ETA panel → restored as a floating Modal popup (taps "Start Escort" to open,
+ *    user picks duration, then confirms). Options: 15min, 30min, 45min, 1hr, Xhr Ymin.
+ * 2. Timer bug fixed — server returns `datetime.utcnow().isoformat()` with NO "Z"
+ *    suffix, so JS parses it as local time, adding UTC offset (e.g. +60 min in Nigeria).
+ *    Fix: append "Z" before parsing so it's always treated as UTC.
+ * 3. All other logic (GPS, background task, session restore) unchanged.
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import AsyncStorage from '../../utils/asyncStorageShim';
 import {
   View, Text, TouchableOpacity, StyleSheet, Alert, ActivityIndicator,
-  AppState, Dimensions, Platform, Modal, TextInput,
+  AppState, Dimensions, Platform, Modal, TextInput, ScrollView,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter, useFocusEffect } from 'expo-router';
@@ -41,6 +36,20 @@ import BACKEND_URL from '../../utils/config';
 
 const { width: W, height: H } = Dimensions.get('window');
 const ESCORT_TASK = 'background-location-escort';
+
+// ── Timezone-safe ISO parser ──────────────────────────────────────────────────
+// The backend returns datetime.utcnow().isoformat() which has NO "Z" suffix,
+// e.g. "2025-01-27T09:00:00.123456". Without a suffix, JS engines parse this
+// as LOCAL time, adding the device's UTC offset to the calculation.
+// Fix: always ensure the string ends with "Z" before parsing.
+function parseUtcIso(isoString: string): number {
+  if (!isoString) return Date.now();
+  const normalized = isoString.endsWith('Z') || isoString.includes('+')
+    ? isoString
+    : isoString + 'Z';
+  const ms = new Date(normalized).getTime();
+  return isNaN(ms) ? Date.now() : ms;
+}
 
 // ── Background task ───────────────────────────────────────────────────────────
 if (!TaskManager.isTaskDefined(ESCORT_TASK)) {
@@ -67,145 +76,304 @@ if (!TaskManager.isTaskDefined(ESCORT_TASK)) {
   });
 }
 
-// ── Animated pulse ring component ─────────────────────────────────────────────
+// ── Duration option type ──────────────────────────────────────────────────────
+interface DurationOption {
+  label: string;
+  hours: number;
+  minutes: number; // total in minutes for display; hours field for API
+}
+
+const QUICK_OPTIONS: DurationOption[] = [
+  { label: '15 min',  hours: 0.25, minutes: 15 },
+  { label: '30 min',  hours: 0.5,  minutes: 30 },
+  { label: '45 min',  hours: 0.75, minutes: 45 },
+  { label: '1 hr',    hours: 1,    minutes: 60 },
+];
+
+// ── ETA Picker Modal ──────────────────────────────────────────────────────────
+interface EtaPickerProps {
+  visible: boolean;
+  onClose: () => void;
+  onConfirm: (durationHours: number, label: string) => void;
+}
+
+function EtaPicker({ visible, onClose, onConfirm }: EtaPickerProps) {
+  const [selected, setSelected]       = useState<number | null>(null); // index into QUICK_OPTIONS
+  const [customHrs, setCustomHrs]     = useState('');
+  const [customMins, setCustomMins]   = useState('');
+
+  const isCustomFilled = customHrs.length > 0 || customMins.length > 0;
+  const activeSelection = isCustomFilled ? 'custom' : selected;
+
+  const handleConfirm = () => {
+    if (isCustomFilled) {
+      const h = parseInt(customHrs || '0', 10);
+      const m = parseInt(customMins || '0', 10);
+      const totalHours = h + m / 60;
+      if (totalHours <= 0) {
+        Alert.alert('Invalid Duration', 'Please enter a valid duration.');
+        return;
+      }
+      const label = [h > 0 && `${h} hr`, m > 0 && `${m} min`].filter(Boolean).join(' ');
+      onConfirm(totalHours, label);
+    } else if (selected !== null) {
+      const opt = QUICK_OPTIONS[selected];
+      onConfirm(opt.hours, opt.label);
+    } else {
+      Alert.alert('Select Duration', 'Please choose how long you need escort for.');
+    }
+  };
+
+  const reset = () => {
+    setSelected(null);
+    setCustomHrs('');
+    setCustomMins('');
+  };
+
+  return (
+    <Modal
+      visible={visible}
+      transparent
+      animationType="slide"
+      onRequestClose={onClose}
+      statusBarTranslucent
+    >
+      {/* Scrim */}
+      <TouchableOpacity
+        style={eta.scrim}
+        activeOpacity={1}
+        onPress={onClose}
+      />
+
+      {/* Sheet */}
+      <View style={eta.sheet}>
+        {/* Handle */}
+        <View style={eta.handle} />
+
+        {/* Header */}
+        <View style={eta.sheetHeader}>
+          <View>
+            <Text style={eta.sheetTitle}>How long do you need escort?</Text>
+            <Text style={eta.sheetSub}>Select a duration or enter a custom time</Text>
+          </View>
+          <TouchableOpacity onPress={onClose} style={eta.closeBtn}>
+            <Ionicons name="close" size={20} color="#64748B" />
+          </TouchableOpacity>
+        </View>
+
+        {/* Quick options */}
+        <View style={eta.quickGrid}>
+          {QUICK_OPTIONS.map((opt, i) => {
+            const active = activeSelection === i;
+            return (
+              <TouchableOpacity
+                key={i}
+                style={[eta.quickBtn, active && eta.quickBtnActive]}
+                onPress={() => {
+                  setSelected(i);
+                  setCustomHrs('');
+                  setCustomMins('');
+                }}
+                activeOpacity={0.75}
+              >
+                <Ionicons
+                  name="time-outline"
+                  size={18}
+                  color={active ? '#fff' : '#64748B'}
+                />
+                <Text style={[eta.quickLabel, active && eta.quickLabelActive]}>
+                  {opt.label}
+                </Text>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+
+        {/* Divider */}
+        <View style={eta.dividerRow}>
+          <View style={eta.dividerLine} />
+          <Text style={eta.dividerText}>or custom</Text>
+          <View style={eta.dividerLine} />
+        </View>
+
+        {/* Custom input */}
+        <View style={[eta.customBox, isCustomFilled && eta.customBoxActive]}>
+          <Ionicons name="create-outline" size={16} color={isCustomFilled ? '#3B82F6' : '#64748B'} />
+          <View style={eta.customField}>
+            <TextInput
+              style={eta.customInput}
+              value={customHrs}
+              onChangeText={(t) => setCustomHrs(t.replace(/[^0-9]/g, ''))}
+              placeholder="0"
+              placeholderTextColor="#475569"
+              keyboardType="numeric"
+              maxLength={2}
+              selectTextOnFocus
+            />
+            <Text style={eta.customUnit}>hrs</Text>
+          </View>
+          <Text style={eta.customSep}>:</Text>
+          <View style={eta.customField}>
+            <TextInput
+              style={eta.customInput}
+              value={customMins}
+              onChangeText={(t) => {
+                const n = parseInt(t.replace(/[^0-9]/g, '') || '0', 10);
+                setCustomMins(String(Math.min(59, n)));
+              }}
+              placeholder="00"
+              placeholderTextColor="#475569"
+              keyboardType="numeric"
+              maxLength={2}
+              selectTextOnFocus
+            />
+            <Text style={eta.customUnit}>min</Text>
+          </View>
+        </View>
+
+        {/* Confirm */}
+        <TouchableOpacity
+          style={[eta.confirmBtn, activeSelection === null && eta.confirmBtnDisabled]}
+          onPress={handleConfirm}
+          activeOpacity={0.85}
+        >
+          <LinearGradient
+            colors={activeSelection !== null ? ['#2563EB', '#1d4ed8'] : ['#1E293B', '#1E293B']}
+            start={{ x: 0, y: 0 }} end={{ x: 1, y: 0 }}
+            style={eta.confirmGrad}
+          >
+            <Ionicons name="navigate" size={18} color="#fff" />
+            <Text style={eta.confirmText}>
+              {activeSelection === null
+                ? 'Select a duration'
+                : isCustomFilled
+                  ? `Start — ${customHrs || '0'}h ${customMins || '0'}m`
+                  : `Start — ${QUICK_OPTIONS[selected!].label}`}
+            </Text>
+          </LinearGradient>
+        </TouchableOpacity>
+      </View>
+    </Modal>
+  );
+}
+
+const eta = StyleSheet.create({
+  scrim: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+  },
+  sheet: {
+    position: 'absolute',
+    bottom: 0,
+    left: 0,
+    right: 0,
+    backgroundColor: '#0F172A',
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    paddingHorizontal: 20,
+    paddingBottom: Platform.OS === 'ios' ? 40 : 28,
+    borderTopWidth: 1,
+    borderColor: '#1E293B',
+  },
+  handle: {
+    width: 40, height: 4, borderRadius: 2,
+    backgroundColor: '#334155',
+    alignSelf: 'center',
+    marginTop: 12, marginBottom: 20,
+  },
+  sheetHeader: {
+    flexDirection: 'row', justifyContent: 'space-between',
+    alignItems: 'flex-start', marginBottom: 22,
+  },
+  sheetTitle: { fontSize: 18, fontWeight: '700', color: '#F1F5F9', marginBottom: 4 },
+  sheetSub:   { fontSize: 13, color: '#64748B' },
+  closeBtn:   { width: 36, height: 36, borderRadius: 10, backgroundColor: '#1E293B', justifyContent: 'center', alignItems: 'center' },
+  quickGrid:  { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginBottom: 20 },
+  quickBtn:   {
+    flex: 1, minWidth: '44%', flexDirection: 'row', alignItems: 'center', gap: 8,
+    backgroundColor: '#1E293B', borderRadius: 12, paddingVertical: 14,
+    paddingHorizontal: 14, borderWidth: 1.5, borderColor: '#334155',
+  },
+  quickBtnActive: { backgroundColor: '#2563EB', borderColor: '#3B82F6' },
+  quickLabel:     { fontSize: 15, fontWeight: '600', color: '#94A3B8' },
+  quickLabelActive: { color: '#fff' },
+  dividerRow:   { flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 16 },
+  dividerLine:  { flex: 1, height: 1, backgroundColor: '#1E293B' },
+  dividerText:  { fontSize: 12, color: '#475569', fontWeight: '600' },
+  customBox: {
+    flexDirection: 'row', alignItems: 'center', gap: 12,
+    backgroundColor: '#1E293B', borderRadius: 12, padding: 14,
+    borderWidth: 1.5, borderColor: '#334155', marginBottom: 20,
+  },
+  customBoxActive: { borderColor: '#3B82F6', backgroundColor: '#172033' },
+  customField: { flexDirection: 'row', alignItems: 'baseline', gap: 4 },
+  customInput: {
+    fontSize: 28, fontWeight: '700', color: '#F1F5F9',
+    minWidth: 44, textAlign: 'center',
+    fontVariant: ['tabular-nums' as any],
+  },
+  customUnit:   { fontSize: 13, color: '#64748B', fontWeight: '600' },
+  customSep:    { fontSize: 24, color: '#334155', fontWeight: '300', paddingHorizontal: 4 },
+  confirmBtn:    { borderRadius: 14, overflow: 'hidden' },
+  confirmBtnDisabled: { opacity: 0.5 },
+  confirmGrad:   { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10, paddingVertical: 16 },
+  confirmText:   { fontSize: 16, fontWeight: '700', color: '#fff' },
+});
+
+// ── Animated pulse ring ───────────────────────────────────────────────────────
 function PulseRing({ delay = 0, color = '#3B82F6' }: { delay?: number; color?: string }) {
   const scale   = useSharedValue(0.4);
   const opacity = useSharedValue(0.7);
-
   useEffect(() => {
-    scale.value = withDelay(delay,
-      withRepeat(withTiming(1.8, { duration: 2200, easing: Easing.out(Easing.quad) }), -1, false)
-    );
-    opacity.value = withDelay(delay,
-      withRepeat(withTiming(0, { duration: 2200, easing: Easing.out(Easing.quad) }), -1, false)
-    );
+    scale.value   = withDelay(delay, withRepeat(withTiming(1.8, { duration: 2200, easing: Easing.out(Easing.quad) }), -1, false));
+    opacity.value = withDelay(delay, withRepeat(withTiming(0,   { duration: 2200, easing: Easing.out(Easing.quad) }), -1, false));
   }, []);
-
-  const style = useAnimatedStyle(() => ({
-    transform: [{ scale: scale.value }],
-    opacity:   opacity.value,
-  }));
-
-  return (
-    <Animated.View style={[StyleSheet.absoluteFillObject, style, {
-      borderRadius: 999,
-      borderWidth:  2,
-      borderColor:  color,
-    }]} />
-  );
+  const style = useAnimatedStyle(() => ({ transform: [{ scale: scale.value }], opacity: opacity.value }));
+  return <Animated.View style={[StyleSheet.absoluteFillObject, style, { borderRadius: 999, borderWidth: 2, borderColor: color }]} />;
 }
 
 // ── Radar sweep ───────────────────────────────────────────────────────────────
 function RadarSweep({ active }: { active: boolean }) {
   const rotation = useSharedValue(0);
-
   useEffect(() => {
     if (active) {
-      rotation.value = withRepeat(
-        withTiming(360, { duration: 3000, easing: Easing.linear }),
-        -1, false
-      );
-    } else {
-      rotation.value = 0;
-    }
+      rotation.value = withRepeat(withTiming(360, { duration: 3000, easing: Easing.linear }), -1, false);
+    } else { rotation.value = 0; }
   }, [active]);
-
-  const style = useAnimatedStyle(() => ({
-    transform: [{ rotate: `${rotation.value}deg` }],
-  }));
-
+  const style = useAnimatedStyle(() => ({ transform: [{ rotate: `${rotation.value}deg` }] }));
   return (
     <Animated.View style={[StyleSheet.absoluteFillObject, style, { borderRadius: 999, overflow: 'hidden' }]}>
       <LinearGradient
         colors={['transparent', 'transparent', active ? '#3B82F630' : 'transparent', active ? '#3B82F660' : 'transparent']}
-        start={{ x: 0.5, y: 0.5 }}
-        end={{ x: 1, y: 0 }}
+        start={{ x: 0.5, y: 0.5 }} end={{ x: 1, y: 0 }}
         style={StyleSheet.absoluteFillObject}
       />
     </Animated.View>
   );
 }
 
-// ── Shield icon with glow ─────────────────────────────────────────────────────
+// ── Shield orb ────────────────────────────────────────────────────────────────
 function ShieldOrb({ active }: { active: boolean }) {
-  const glow    = useSharedValue(0.5);
+  const glow      = useSharedValue(0.5);
   const iconScale = useSharedValue(1);
-  const ORB_SIZE = 140;
-
+  const ORB_SIZE  = 140;
   useEffect(() => {
     if (active) {
-      glow.value = withRepeat(
-        withSequence(
-          withTiming(1,   { duration: 1500, easing: Easing.inOut(Easing.sin) }),
-          withTiming(0.5, { duration: 1500, easing: Easing.inOut(Easing.sin) })
-        ),
-        -1, false
-      );
-      iconScale.value = withRepeat(
-        withSequence(
-          withTiming(1.08, { duration: 1200 }),
-          withTiming(1,    { duration: 1200 })
-        ),
-        -1, false
-      );
-    } else {
-      glow.value    = 1;
-      iconScale.value = 1;
-    }
+      glow.value      = withRepeat(withSequence(withTiming(1, { duration: 1500, easing: Easing.inOut(Easing.sin) }), withTiming(0.5, { duration: 1500, easing: Easing.inOut(Easing.sin) })), -1, false);
+      iconScale.value = withRepeat(withSequence(withTiming(1.08, { duration: 1200 }), withTiming(1, { duration: 1200 })), -1, false);
+    } else { glow.value = 1; iconScale.value = 1; }
   }, [active]);
-
-  const glowStyle = useAnimatedStyle(() => ({
-    shadowOpacity: interpolate(glow.value, [0.5, 1], [0.3, 0.85]),
-    shadowRadius:  interpolate(glow.value, [0.5, 1], [8, 28]),
-  }));
-
-  const iconStyle = useAnimatedStyle(() => ({
-    transform: [{ scale: iconScale.value }],
-  }));
-
+  const glowStyle = useAnimatedStyle(() => ({ shadowOpacity: interpolate(glow.value, [0.5, 1], [0.3, 0.85]), shadowRadius: interpolate(glow.value, [0.5, 1], [8, 28]) }));
+  const iconStyle = useAnimatedStyle(() => ({ transform: [{ scale: iconScale.value }] }));
   return (
     <View style={{ width: ORB_SIZE, height: ORB_SIZE, alignItems: 'center', justifyContent: 'center' }}>
-      {/* Radar rings */}
-      {active && (
-        <>
-          <PulseRing delay={0}    color="#3B82F6" />
-          <PulseRing delay={700}  color="#3B82F6" />
-          <PulseRing delay={1400} color="#3B82F6" />
-        </>
-      )}
-
-      {/* Radar sweep */}
+      {active && (<><PulseRing delay={0} color="#3B82F6" /><PulseRing delay={700} color="#3B82F6" /><PulseRing delay={1400} color="#3B82F6" /></>)}
       <RadarSweep active={active} />
-
-      {/* Orb itself */}
-      <Animated.View style={[{
-        width: ORB_SIZE, height: ORB_SIZE, borderRadius: ORB_SIZE / 2,
-        justifyContent: 'center', alignItems: 'center',
-        shadowColor:  active ? '#3B82F6' : '#1E293B',
-        shadowOffset: { width: 0, height: 0 },
-        elevation: 20,
-        overflow: 'hidden',
-      }, glowStyle]}>
-        <LinearGradient
-          colors={active
-            ? ['#1d4ed8', '#1E3A5F', '#0F172A']
-            : ['#1E3A5F', '#162032', '#0F172A']}
-          style={[StyleSheet.absoluteFillObject, { borderRadius: ORB_SIZE / 2 }]}
-        />
-        {/* Crosshair ring */}
-        <View style={{
-          position: 'absolute',
-          width: ORB_SIZE - 16, height: ORB_SIZE - 16,
-          borderRadius: (ORB_SIZE - 16) / 2,
-          borderWidth: 1,
-          borderColor: active ? '#3B82F640' : '#ffffff15',
-        }} />
+      <Animated.View style={[{ width: ORB_SIZE, height: ORB_SIZE, borderRadius: ORB_SIZE / 2, justifyContent: 'center', alignItems: 'center', shadowColor: active ? '#3B82F6' : '#1E293B', shadowOffset: { width: 0, height: 0 }, elevation: 20, overflow: 'hidden' }, glowStyle]}>
+        <LinearGradient colors={active ? ['#1d4ed8', '#1E3A5F', '#0F172A'] : ['#1E3A5F', '#162032', '#0F172A']} style={[StyleSheet.absoluteFillObject, { borderRadius: ORB_SIZE / 2 }]} />
+        <View style={{ position: 'absolute', width: ORB_SIZE - 16, height: ORB_SIZE - 16, borderRadius: (ORB_SIZE - 16) / 2, borderWidth: 1, borderColor: active ? '#3B82F640' : '#ffffff15' }} />
         <Animated.View style={iconStyle}>
-          <Ionicons
-            name={active ? 'shield-checkmark' : 'shield-outline'}
-            size={52}
-            color={active ? '#60A5FA' : '#3B82F6'}
-          />
+          <Ionicons name={active ? 'shield-checkmark' : 'shield-outline'} size={52} color={active ? '#60A5FA' : '#3B82F6'} />
         </Animated.View>
       </Animated.View>
     </View>
@@ -215,58 +383,38 @@ function ShieldOrb({ active }: { active: boolean }) {
 // ── Feature pill ──────────────────────────────────────────────────────────────
 function FeaturePill({ icon, text, index }: { icon: string; text: string; index: number }) {
   return (
-    <Animated.View
-      entering={FadeInUp.delay(400 + index * 100).springify()}
-      style={pill.wrap}
-    >
-      <View style={pill.iconBox}>
-        <Ionicons name={icon as any} size={16} color="#3B82F6" />
-      </View>
+    <Animated.View entering={FadeInUp.delay(400 + index * 100).springify()} style={pill.wrap}>
+      <View style={pill.iconBox}><Ionicons name={icon as any} size={16} color="#3B82F6" /></View>
       <Text style={pill.text}>{text}</Text>
     </Animated.View>
   );
 }
-
 const pill = StyleSheet.create({
   wrap:    { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 11, paddingHorizontal: 16, backgroundColor: '#ffffff08', borderRadius: 12, borderWidth: 1, borderColor: '#ffffff10', marginBottom: 10 },
   iconBox: { width: 30, height: 30, borderRadius: 8, backgroundColor: '#3B82F615', justifyContent: 'center', alignItems: 'center' },
   text:    { color: '#CBD5E1', fontSize: 13.5, fontWeight: '500', flex: 1 },
 });
 
-// ── GPS status chip ───────────────────────────────────────────────────────────
+// ── GPS chip ──────────────────────────────────────────────────────────────────
 function GpsChip({ gps }: { gps: { lat: number; lng: number; updatedAt: string } | null }) {
   const dot = useSharedValue(1);
-
   useEffect(() => {
-    dot.value = withRepeat(
-      withSequence(withTiming(0.2, { duration: 700 }), withTiming(1, { duration: 700 })),
-      -1, false
-    );
+    dot.value = withRepeat(withSequence(withTiming(0.2, { duration: 700 }), withTiming(1, { duration: 700 })), -1, false);
   }, []);
-
   const dotStyle = useAnimatedStyle(() => ({ opacity: dot.value }));
-
   return (
     <BlurView intensity={18} tint="dark" style={chip.wrap}>
-      <View style={chip.header}>
-        <Animated.View style={[chip.dot, dotStyle]} />
-        <Text style={chip.label}>LIVE GPS</Text>
-      </View>
+      <View style={chip.header}><Animated.View style={[chip.dot, dotStyle]} /><Text style={chip.label}>LIVE GPS</Text></View>
       {gps ? (
         <View>
-          <Text style={chip.coords}>
-            {gps.lat.toFixed(5)}, {gps.lng.toFixed(5)}
-          </Text>
+          <Text style={chip.coords}>{gps.lat.toFixed(5)}, {gps.lng.toFixed(5)}</Text>
           <Text style={chip.updated}>Last ping · {gps.updatedAt}</Text>
         </View>
-      ) : (
-        <Text style={chip.waiting}>Acquiring signal…</Text>
-      )}
+      ) : (<Text style={chip.waiting}>Acquiring signal…</Text>)}
       <Text style={chip.note}>Broadcast every 60 s · background-safe</Text>
     </BlurView>
   );
 }
-
 const chip = StyleSheet.create({
   wrap:    { borderRadius: 16, overflow: 'hidden', padding: 16, borderWidth: 1, borderColor: '#3B82F630', marginTop: 4 },
   header:  { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 10 },
@@ -280,21 +428,22 @@ const chip = StyleSheet.create({
 
 // ── Timer display ─────────────────────────────────────────────────────────────
 function ElapsedTimer({ seconds }: { seconds: number }) {
-  const m = Math.floor(seconds / 60);
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
   const s = seconds % 60;
   return (
-    <View style={timer.wrap}>
-      <Text style={timer.label}>ACTIVE FOR</Text>
-      <Text style={timer.value}>
+    <View style={tmr.wrap}>
+      <Text style={tmr.label}>ACTIVE FOR</Text>
+      <Text style={tmr.value}>
+        {h > 0 && <>{String(h).padStart(2, '0')}<Text style={tmr.sep}>:</Text></>}
         {String(m).padStart(2, '0')}
-        <Text style={timer.sep}>:</Text>
+        <Text style={tmr.sep}>:</Text>
         {String(s).padStart(2, '0')}
       </Text>
     </View>
   );
 }
-
-const timer = StyleSheet.create({
+const tmr = StyleSheet.create({
   wrap:  { alignItems: 'center', paddingVertical: 8 },
   label: { fontSize: 10, fontWeight: '700', color: '#64748B', letterSpacing: 3, marginBottom: 4 },
   value: { fontSize: 52, fontWeight: '700', color: '#F1F5F9', fontVariant: ['tabular-nums' as any], letterSpacing: -2 },
@@ -306,16 +455,19 @@ const timer = StyleSheet.create({
 // ═══════════════════════════════════════════════════════════════════════════════
 export default function Escort() {
   const router = useRouter();
-  const [isTracking,      setIsTracking]      = useState(false);
-  const [loading,         setLoading]         = useState(false);
-  const [checkingPremium, setCheckingPremium] = useState(true);
-  const [isPremium,       setIsPremium]       = useState(false);
-  const [sessionId,       setSessionId]       = useState<string | null>(null);
-  const [startTime,       setStartTime]       = useState<string | null>(null);
-  const [elapsedSeconds,  setElapsedSeconds]  = useState(0);
-  const [currentGps,      setCurrentGps]      = useState<{ lat: number; lng: number; updatedAt: string } | null>(null);
-  const [selectedDuration, setSelectedDuration] = useState<number | 'custom'>(1);
-  const [customHours,     setCustomHours]     = useState('');
+
+  // Core state
+  const [isTracking,       setIsTracking]       = useState(false);
+  const [loading,          setLoading]           = useState(false);
+  const [checkingPremium,  setCheckingPremium]   = useState(true);
+  const [isPremium,        setIsPremium]         = useState(false);
+  const [sessionId,        setSessionId]         = useState<string | null>(null);
+  const [startTime,        setStartTime]         = useState<string | null>(null);
+  const [elapsedSeconds,   setElapsedSeconds]    = useState(0);
+  const [currentGps,       setCurrentGps]        = useState<{ lat: number; lng: number; updatedAt: string } | null>(null);
+
+  // ETA picker modal
+  const [etaModalVisible,  setEtaModalVisible]   = useState(false);
 
   const intervalRef        = useRef<any>(null);
   const timerRef           = useRef<any>(null);
@@ -326,14 +478,13 @@ export default function Escort() {
 
   useEffect(() => { isTrackingRef.current = isTracking; }, [isTracking]);
 
-  // ── Timer ──────────────────────────────────────────────────────────────────
+  // ── Timer (BUG FIX: use parseUtcIso to normalise server timestamps) ─────────
   useEffect(() => {
     if (isTracking && startTime) {
-      const start = new Date(startTime).getTime();
-      setElapsedSeconds(Math.floor((Date.now() - start) / 1000));
-      timerRef.current = setInterval(() => {
-        setElapsedSeconds(Math.floor((Date.now() - start) / 1000));
-      }, 1000);
+      const startMs = parseUtcIso(startTime);
+      const tick = () => setElapsedSeconds(Math.floor((Date.now() - startMs) / 1000));
+      tick(); // immediate first tick
+      timerRef.current = setInterval(tick, 1000);
     } else {
       if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
       setElapsedSeconds(0);
@@ -341,7 +492,7 @@ export default function Escort() {
     return () => { if (timerRef.current) clearInterval(timerRef.current); };
   }, [isTracking, startTime]);
 
-  // ── AppState: foreground ↔ background task swap ───────────────────────────
+  // ── AppState: foreground ↔ background swap ───────────────────────────────
   useEffect(() => {
     const sub = AppState.addEventListener('change', async (nextState) => {
       const prev = appStateRef.current;
@@ -358,7 +509,7 @@ export default function Escort() {
               distanceInterval: 0,
               foregroundService: {
                 notificationTitle: '🛡 Se-Q Escort Active',
-                notificationBody:  'Security can see your location.',
+                notificationBody: 'Security can see your location.',
               },
               pausesUpdatesAutomatically: false,
             });
@@ -374,7 +525,7 @@ export default function Escort() {
     return () => sub.remove();
   }, []);
 
-  // ── Focus ──────────────────────────────────────────────────────────────────
+  // ── Focus ─────────────────────────────────────────────────────────────────
   useFocusEffect(
     useCallback(() => {
       if (isTrackingRef.current) {
@@ -385,13 +536,11 @@ export default function Escort() {
         trackingStartedRef.current = false;
         checkActiveEscort();
       }
-      return () => {
-        if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; }
-      };
+      return () => { if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; } };
     }, [])
   );
 
-  // ── Check / restore session ────────────────────────────────────────────────
+  // ── Check / restore session ───────────────────────────────────────────────
   const checkActiveEscort = async () => {
     setCheckingPremium(true);
     try {
@@ -455,17 +604,9 @@ export default function Escort() {
     }
   };
 
-  // ── Start escort ──────────────────────────────────────────────────────────
-  const startEscort = async (selectedDuration: number | 'custom', customHours: string) => {
-    // Determine final duration in hours
-    let durationHours: number;
-    if (selectedDuration === 'custom') {
-      const parsed = parseInt(customHours, 10);
-      durationHours = isNaN(parsed) || parsed <= 0 ? 1 : parsed;
-    } else {
-      durationHours = selectedDuration;
-    }
-
+  // ── Start escort (called from ETA picker) ────────────────────────────────
+  const startEscort = async (durationHours: number, durationLabel: string) => {
+    setEtaModalVisible(false);
     if (!isPremium) { Alert.alert('Premium Required', 'Please upgrade to use Security Escort.'); return; }
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
     setLoading(true);
@@ -478,8 +619,6 @@ export default function Escort() {
       }
       try { await Location.requestBackgroundPermissionsAsync(); } catch (_) {}
 
-      // FIX: use getLocation('soft') — adds timeout + last-known fallback.
-      // If GPS is unavailable, block start and show an error rather than sending 0,0.
       const startCoords = await getLocation('soft');
       if (!startCoords) {
         Alert.alert('Location Required', 'Unable to get your location. Please enable GPS and try again.');
@@ -506,6 +645,7 @@ export default function Escort() {
       );
 
       const newSessionId = res.data.session_id;
+      // Use client-side ISO timestamp (always has Z, always correct)
       const startedAt    = new Date().toISOString();
       await AsyncStorage.multiSet([
         ['active_escort', JSON.stringify({ session_id: newSessionId, started_at: startedAt, duration_hours: durationHours })],
@@ -526,7 +666,7 @@ export default function Escort() {
           });
           if (check.data?.is_active && check.data?.session_id) {
             const sid = check.data.session_id;
-            const sat = check.data.started_at || new Date().toISOString();
+            const sat = new Date().toISOString(); // use client time (correct)
             await AsyncStorage.multiSet([
               ['active_escort', JSON.stringify({ session_id: sid, started_at: sat })],
               ['auth_token', tok],
@@ -546,32 +686,21 @@ export default function Escort() {
     }
   };
 
-  // ── GPS point ─────────────────────────────────────────────────────────────
+  // ── GPS post ─────────────────────────────────────────────────────────────
   const postGpsPoint = async (token: string) => {
     try {
-      // FIX: use getLocation('soft') — adds 12-second timeout + last-known fallback.
-      // If coords are null, skip this poll rather than sending 0,0.
       const loc = await getLocation('soft');
-      if (!loc) return; // GPS unavailable — skip; next interval will retry
-      setCurrentGps({
-        lat:       loc.latitude,
-        lng:       loc.longitude,
-        updatedAt: new Date().toLocaleTimeString(),
-      });
+      if (!loc) return;
+      setCurrentGps({ lat: loc.latitude, lng: loc.longitude, updatedAt: new Date().toLocaleTimeString() });
       await axios.post(
         `${BACKEND_URL}/api/escort/location`,
-        {
-          latitude:  loc.latitude,
-          longitude: loc.longitude,
-          accuracy:  loc.accuracy,
-          timestamp: new Date().toISOString(),
-        },
+        { latitude: loc.latitude, longitude: loc.longitude, accuracy: loc.accuracy, timestamp: new Date().toISOString() },
         { headers: { Authorization: `Bearer ${token}` }, timeout: 10000 }
       );
     } catch (_) {}
   };
 
-  // ── Start tracking ────────────────────────────────────────────────────────
+  // ── Start location tracking ───────────────────────────────────────────────
   const startLocationTracking = async (token: string) => {
     if (trackingStartedRef.current) return;
     trackingStartedRef.current = true;
@@ -623,15 +752,10 @@ export default function Escort() {
   if (checkingPremium) {
     return (
       <View style={{ flex: 1, backgroundColor: '#0A0F1C' }}>
-        <LinearGradient
-          colors={['#0A0F1C', '#0F172A', '#0A0F1C']}
-          style={StyleSheet.absoluteFillObject}
-        />
+        <LinearGradient colors={['#0A0F1C', '#0F172A', '#0A0F1C']} style={StyleSheet.absoluteFillObject} />
         <SafeAreaView style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
           <ActivityIndicator size="large" color="#3B82F6" />
-          <Text style={{ color: '#64748B', marginTop: 14, fontSize: 13, letterSpacing: 1 }}>
-            AUTHENTICATING
-          </Text>
+          <Text style={{ color: '#64748B', marginTop: 14, fontSize: 13, letterSpacing: 1 }}>AUTHENTICATING</Text>
         </SafeAreaView>
       </View>
     );
@@ -640,15 +764,12 @@ export default function Escort() {
   // ── Main render ───────────────────────────────────────────────────────────
   return (
     <View style={{ flex: 1, backgroundColor: '#0A0F1C' }}>
-      {/* Background gradient */}
       <LinearGradient
-        colors={isTracking
-          ? ['#051024', '#0c1a35', '#071322']
-          : ['#0A0F1C', '#0F172A', '#0A0F1C']}
+        colors={isTracking ? ['#051024', '#0c1a35', '#071322'] : ['#0A0F1C', '#0F172A', '#0A0F1C']}
         style={StyleSheet.absoluteFillObject}
       />
 
-      {/* Subtle grid texture */}
+      {/* Grid texture */}
       <View style={st.gridOverlay} pointerEvents="none">
         {Array.from({ length: 8 }).map((_, i) => (
           <View key={i} style={[st.gridLine, { top: `${i * 14}%` as any }]} />
@@ -670,7 +791,6 @@ export default function Escort() {
               </Animated.View>
             )}
           </View>
-          {/* Premium badge */}
           <View style={st.premiumBadge}>
             <Ionicons name="star" size={11} color="#F59E0B" />
             <Text style={st.premiumText}>PRO</Text>
@@ -679,7 +799,11 @@ export default function Escort() {
 
         {/* ── IDLE STATE ── */}
         {!isTracking ? (
-          <View style={st.body}>
+          <ScrollView
+            contentContainerStyle={st.body}
+            showsVerticalScrollIndicator={false}
+            keyboardShouldPersistTaps="handled"
+          >
             {/* Orb */}
             <Animated.View entering={ZoomIn.delay(100).springify()} style={st.orbWrap}>
               <ShieldOrb active={false} />
@@ -696,70 +820,24 @@ export default function Escort() {
             {/* Feature pills */}
             <View style={st.pillsWrap}>
               {[
-                { icon: 'location-outline',       text: 'GPS broadcasted every 60 seconds' },
-                { icon: 'shield-outline',          text: 'Runs safely in the background' },
-                { icon: 'people-outline',          text: 'Visible to all nearby security' },
-                { icon: 'trash-outline',           text: 'Route deleted on arrival' },
+                { icon: 'location-outline',  text: 'GPS broadcasted every 60 seconds' },
+                { icon: 'shield-outline',    text: 'Runs safely in the background' },
+                { icon: 'people-outline',    text: 'Visible to all nearby security' },
+                { icon: 'trash-outline',     text: 'Route deleted on arrival' },
               ].map((f, i) => <FeaturePill key={i} icon={f.icon} text={f.text} index={i} />)}
             </View>
 
-            {/* ETA / Duration Selection */}
-            <Animated.View entering={FadeInUp.delay(500)} style={etaCard.wrap}>
-              <Text style={etaCard.label}>SELECT DURATION</Text>
-              <View style={etaCard.optionsRow}>
-                {[1, 2, 4, 8].map((hrs) => (
-                  <TouchableOpacity
-                    key={hrs}
-                    style={[etaCard.optionBtn, selectedDuration === hrs && etaCard.optionBtnActive]}
-                    onPress={() => {
-                      setSelectedDuration(hrs);
-                      setCustomHours('');
-                    }}
-                    activeOpacity={0.7}
-                  >
-                    <Text style={[etaCard.optionText, selectedDuration === hrs && etaCard.optionTextActive]}>
-                      {hrs} Hr{hrs > 1 ? 's' : ''}
-                    </Text>
-                  </TouchableOpacity>
-                ))}
-              </View>
-
-              {/* Custom hours input — always visible below the options */}
-              <View style={etaCard.customRow}>
-                <View style={etaCard.customInputWrap}>
-                  <Text style={etaCard.customLabel}>Or enter custom hours:</Text>
-                  <TextInput
-                    style={etaCard.customInput}
-                    value={customHours}
-                    onChangeText={(text) => {
-                      const cleaned = text.replace(/[^0-9]/g, '');
-                      setCustomHours(cleaned);
-                      if (cleaned.length > 0) {
-                        setSelectedDuration('custom');
-                      }
-                    }}
-                    placeholder="e.g. 3"
-                    placeholderTextColor="#94A3B8"
-                    keyboardType="numeric"
-                    maxLength={3}
-                  />
-                  <Text style={etaCard.customUnit}>Hrs</Text>
-                </View>
-              </View>
-            </Animated.View>
-
-            {/* CTA */}
-            <Animated.View entering={FadeInUp.delay(700)} style={st.ctaWrap}>
+            {/* CTA — opens ETA picker */}
+            <Animated.View entering={FadeInUp.delay(600)} style={st.ctaWrap}>
               <TouchableOpacity
-                onPress={() => startEscort(selectedDuration, customHours)}
+                onPress={() => setEtaModalVisible(true)}
                 disabled={loading}
                 activeOpacity={0.85}
                 style={st.startBtnWrap}
               >
                 <LinearGradient
                   colors={loading ? ['#1E3A5F', '#1E3A5F'] : ['#2563EB', '#1d4ed8', '#1e40af']}
-                  start={{ x: 0, y: 0 }}
-                  end={{ x: 1, y: 1 }}
+                  start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }}
                   style={st.startBtn}
                 >
                   {loading ? (
@@ -769,32 +847,23 @@ export default function Escort() {
                       <View style={st.startIconBox}>
                         <Ionicons name="navigate" size={20} color="#fff" />
                       </View>
-                      <Text style={st.startBtnText}>
-                        {selectedDuration === 'custom'
-                          ? `Start Escort (${customHours || '?'} Hrs)`
-                          : `Start Escort (${selectedDuration} Hr${selectedDuration > 1 ? 's' : ''})`}
-                      </Text>
-                      <Ionicons name="arrow-forward" size={18} color="#93C5FD" style={{ marginLeft: 4 }} />
+                      <Text style={st.startBtnText}>Start Escort</Text>
+                      <Ionicons name="chevron-up" size={18} color="#93C5FD" style={{ marginLeft: 4 }} />
                     </>
                   )}
                 </LinearGradient>
               </TouchableOpacity>
             </Animated.View>
-          </View>
+          </ScrollView>
         ) : (
           /* ── ACTIVE STATE ── */
           <Animated.View entering={FadeIn.duration(500)} style={st.body}>
-            {/* Animated orb */}
-            <View style={st.orbWrap}>
-              <ShieldOrb active={true} />
-            </View>
+            <View style={st.orbWrap}><ShieldOrb active={true} /></View>
 
-            {/* Timer */}
             <Animated.View entering={FadeInDown.delay(150)}>
               <ElapsedTimer seconds={elapsedSeconds} />
             </Animated.View>
 
-            {/* Status row */}
             <Animated.View entering={FadeInUp.delay(200)} style={st.statusRow}>
               <View style={st.statusChip}>
                 <Ionicons name="checkmark-circle" size={14} color="#10B981" />
@@ -806,12 +875,10 @@ export default function Escort() {
               </View>
             </Animated.View>
 
-            {/* GPS chip */}
             <Animated.View entering={FadeInUp.delay(300)} style={{ width: '100%' }}>
               <GpsChip gps={currentGps} />
             </Animated.View>
 
-            {/* Safety tip */}
             <Animated.View entering={FadeInUp.delay(400)} style={st.tipBox}>
               <Ionicons name="information-circle-outline" size={16} color="#64748B" />
               <Text style={st.tipText}>
@@ -819,18 +886,11 @@ export default function Escort() {
               </Text>
             </Animated.View>
 
-            {/* Arrived button */}
             <Animated.View entering={FadeInUp.delay(500)} style={st.ctaWrap}>
-              <TouchableOpacity
-                onPress={stopEscort}
-                disabled={loading}
-                activeOpacity={0.85}
-                style={st.startBtnWrap}
-              >
+              <TouchableOpacity onPress={stopEscort} disabled={loading} activeOpacity={0.85} style={st.startBtnWrap}>
                 <LinearGradient
                   colors={loading ? ['#1E293B', '#1E293B'] : ['#059669', '#047857', '#065f46']}
-                  start={{ x: 0, y: 0 }}
-                  end={{ x: 1, y: 1 }}
+                  start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }}
                   style={st.startBtn}
                 >
                   {loading ? (
@@ -849,19 +909,21 @@ export default function Escort() {
           </Animated.View>
         )}
       </SafeAreaView>
+
+      {/* ETA Picker — floating modal */}
+      <EtaPicker
+        visible={etaModalVisible}
+        onClose={() => setEtaModalVisible(false)}
+        onConfirm={startEscort}
+      />
     </View>
   );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// STYLES
-// ═══════════════════════════════════════════════════════════════════════════════
+// ── Styles ────────────────────────────────────────────────────────────────────
 const st = StyleSheet.create({
-  // Grid overlay
-  gridOverlay: { position: 'absolute', inset: 0, overflow: 'hidden' },
-  gridLine:    { position: 'absolute', left: 0, right: 0, height: StyleSheet.hairlineWidth, backgroundColor: '#ffffff06' },
-
-  // Header
+  gridOverlay:  { position: 'absolute', inset: 0, overflow: 'hidden' },
+  gridLine:     { position: 'absolute', left: 0, right: 0, height: StyleSheet.hairlineWidth, backgroundColor: '#ffffff06' },
   header:       { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 20, paddingTop: 8, paddingBottom: 16 },
   backBtn:      { width: 38, height: 38, borderRadius: 10, backgroundColor: '#ffffff0a', justifyContent: 'center', alignItems: 'center', borderWidth: 1, borderColor: '#ffffff10' },
   headerCenter: { flex: 1, alignItems: 'center', flexDirection: 'row', justifyContent: 'center', gap: 10 },
@@ -871,47 +933,20 @@ const st = StyleSheet.create({
   liveText:     { fontSize: 9, fontWeight: '800', color: '#EF4444', letterSpacing: 1.5 },
   premiumBadge: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: '#F59E0B15', borderRadius: 8, paddingHorizontal: 8, paddingVertical: 4, borderWidth: 1, borderColor: '#F59E0B30' },
   premiumText:  { fontSize: 10, fontWeight: '700', color: '#F59E0B', letterSpacing: 1 },
-
-  // Layout
-  body:         { flex: 1, paddingHorizontal: 24, paddingTop: 8, alignItems: 'center' },
+  body:         { flexGrow: 1, paddingHorizontal: 24, paddingTop: 8, alignItems: 'center' },
   orbWrap:      { marginBottom: 28, marginTop: 8 },
   headlineWrap: { alignItems: 'center', marginBottom: 28 },
   headline:     { fontSize: 26, fontWeight: '700', color: '#F1F5F9', textAlign: 'center', marginBottom: 10, letterSpacing: -0.5 },
   subheadline:  { fontSize: 14, color: '#64748B', textAlign: 'center', lineHeight: 21, maxWidth: 300 },
-
-  // Pills
   pillsWrap:    { width: '100%', marginBottom: 28 },
-
-  // Status row (active state)
   statusRow:    { flexDirection: 'row', gap: 10, marginBottom: 18 },
   statusChip:   { flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 7, paddingHorizontal: 13, borderRadius: 20, backgroundColor: '#10B98110', borderWidth: 1, borderColor: '#10B98130' },
   statusChipText: { fontSize: 12, fontWeight: '600', color: '#10B981' },
-
-  // Tip
   tipBox:       { flexDirection: 'row', alignItems: 'flex-start', gap: 10, backgroundColor: '#ffffff06', borderRadius: 12, padding: 14, marginTop: 14, borderWidth: 1, borderColor: '#ffffff0a', width: '100%' },
   tipText:      { flex: 1, fontSize: 12, color: '#64748B', lineHeight: 18 },
-
-  // CTA
-  ctaWrap:      { width: '100%', marginTop: 'auto' as any, paddingBottom: Platform.OS === 'ios' ? 8 : 16 },
+  ctaWrap:      { width: '100%', marginTop: 'auto' as any, paddingBottom: Platform.OS === 'ios' ? 8 : 16, paddingTop: 8 },
   startBtnWrap: { width: '100%', borderRadius: 16, overflow: 'hidden', shadowColor: '#3B82F6', shadowOffset: { width: 0, height: 8 }, shadowOpacity: 0.35, shadowRadius: 16, elevation: 12 },
   startBtn:     { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', paddingVertical: 18, paddingHorizontal: 24, gap: 12 },
   startIconBox: { width: 32, height: 32, borderRadius: 8, backgroundColor: '#ffffff20', justifyContent: 'center', alignItems: 'center' },
   startBtnText: { fontSize: 16, fontWeight: '700', color: '#fff', letterSpacing: 0.3 },
-});
-
-// ETA card styles — light ash background, always visible
-const etaCard = StyleSheet.create({
-  wrap:             { width: '100%', backgroundColor: '#E2E8F0', borderRadius: 16, padding: 18, marginBottom: 20 },
-  label:            { fontSize: 11, fontWeight: '700', color: '#475569', letterSpacing: 2, marginBottom: 14 },
-  optionsRow:       { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
-  optionBtn:        { paddingVertical: 10, paddingHorizontal: 16, borderRadius: 10, backgroundColor: '#CBD5E1', borderWidth: 1, borderColor: '#CBD5E1' },
-  optionBtnActive:  { backgroundColor: '#3B82F6', borderColor: '#3B82F6' },
-  optionText:       { fontSize: 14, fontWeight: '600', color: '#475569' },
-  optionTextActive: { fontSize: 14, fontWeight: '700', color: '#fff' },
-  // Custom hours row — always visible below options
-  customRow:        { marginTop: 18, paddingTop: 14, borderTopWidth: 1, borderTopColor: '#CBD5E1' },
-  customInputWrap:  { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  customLabel:      { fontSize: 13, color: '#475569', fontWeight: '500', flex: 1 },
-  customInput:      { backgroundColor: '#fff', borderRadius: 8, borderWidth: 1, borderColor: '#94A3B8', paddingHorizontal: 12, paddingVertical: 9, fontSize: 14, fontWeight: '600', color: '#1E293B', width: 76, textAlign: 'center' },
-  customUnit:       { fontSize: 14, color: '#64748B', fontWeight: '600' },
 });
