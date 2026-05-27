@@ -1,22 +1,23 @@
 /**
  * components/TrailMapModal.tsx
  *
- * Full-screen map modal that renders a movement trail as a dashed polyline
- * with direction arrows and auto-fit bounds. Used by admin panics and escort
- * sessions to visualize the full GPS path.
+ * Full-screen map modal — renders a GPS movement trail as a coloured polyline
+ * with start/end markers. Uses the same zero-dependency WebView+Leaflet approach
+ * as NativeMap (no Mapbox, no API key required).
+ *
+ * Tile sources:
+ *   Satellite  → Esri World Imagery (free, excellent Africa coverage)
+ *   Streets    → OpenStreetMap
  */
 
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useCallback } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, Platform,
-  Modal, ActivityIndicator, Linking, Dimensions,
+  Modal, ActivityIndicator, Linking,
 } from 'react-native';
+import { WebView } from 'react-native-webview';
 import { Ionicons } from '@expo/vector-icons';
-import BACKEND_URL from '../config/mapbox';
 
-const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get('window');
-
-// ── Coordinate types ──────────────────────────────────────────────────────────
 export interface GpsPoint {
   latitude: number;
   longitude: number;
@@ -32,453 +33,318 @@ interface TrailMapModalProps {
   subtitle?: string;
 }
 
-// ── Mapbox import (lazy, with graceful fallback) ─────────────────────────────
-let Mapbox: any = null;
-let MapView: any = null;
-let Camera: any = null;
-let ShapeSource: any = null;
-let LineLayer: any = null;
-let MarkerView: any = null;
-let GeoJSON: any = null;
-let mapboxLoaded = false;
-let mapboxLoadError: string | null = null;
+// ── Bounding box helper ──────────────────────────────────────────────────────
 
-try {
-  const rnmapbox = require('@rnmapbox/maps');
-  Mapbox      = rnmapbox.default;
-  MapView     = rnmapbox.MapView;
-  Camera      = rnmapbox.Camera;
-  ShapeSource = rnmapbox.ShapeSource;
-  LineLayer   = rnmapbox.LineLayer;
-  MarkerView  = rnmapbox.MarkerView;
-  GeoJSON     = (global as any).GeoJSON;
-  mapboxLoaded = true;
-} catch (e: any) {
-  mapboxLoadError = e?.message ?? 'Failed to load Mapbox';
-  console.error('[TrailMapModal] Mapbox require failed:', mapboxLoadError);
-}
-
-// Set Mapbox token if available
-const MAPBOX_TOKEN = (BACKEND_URL as any)?.MAPBOX_TOKEN || '';
-if (Mapbox && MAPBOX_TOKEN) {
-  try { Mapbox.setAccessToken(MAPBOX_TOKEN); } catch (_) {}
-}
-
-// ── Compute bounding box & center ────────────────────────────────────────────
-function computeBounds(points: GpsPoint[]) {
-  if (!points || points.length === 0) {
-    return { center: [0, 0] as [number, number], padding: 80 };
-  }
-
+function computeCenter(points: GpsPoint[]) {
+  if (!points.length) return { lat: 0, lng: 0, zoom: 14 };
   let minLat = 90, maxLat = -90, minLng = 180, maxLng = -180;
-  for (const pt of points) {
-    if (pt.latitude  < minLat)  minLat  = pt.latitude;
-    if (pt.latitude  > maxLat)  maxLat  = pt.latitude;
-    if (pt.longitude < minLng)  minLng  = pt.longitude;
-    if (pt.longitude > maxLng)  maxLng  = pt.longitude;
+  for (const p of points) {
+    if (p.latitude < minLat) minLat = p.latitude;
+    if (p.latitude > maxLat) maxLat = p.latitude;
+    if (p.longitude < minLng) minLng = p.longitude;
+    if (p.longitude > maxLng) maxLng = p.longitude;
   }
-
-  const centerLat = (minLat + maxLat) / 2;
-  const centerLng = (minLng + maxLng) / 2;
-  const latSpan   = maxLat - minLat;
-  const lngSpan   = maxLng - minLng;
-
-  // Add 20% padding around the trail
-  const padding = Math.max(latSpan, lngSpan) * 0.3;
-
-  return {
-    center: [centerLng, centerLat] as [number, number],
-    padding: Math.max(60, padding * 111000), // rough meters conversion
-  };
+  const lat = (minLat + maxLat) / 2;
+  const lng = (minLng + maxLng) / 2;
+  const latSpan = maxLat - minLat || 0.01;
+  const zoom = Math.max(8, Math.min(16, Math.floor(Math.log2(180 / latSpan))));
+  return { lat, lng, zoom };
 }
 
-// ── Trail line GeoJSON ────────────────────────────────────────────────────────
-function buildTrailGeoJSON(points: GpsPoint[]): any {
-  if (!points || points.length < 2) return null;
+// ── Trail HTML builder ────────────────────────────────────────────────────────
 
-  const coordinates = points.map(p => [p.longitude, p.latitude]);
+function buildTrailHTML(points: GpsPoint[], initialStyle: 'satellite' | 'streets'): string {
+  const { lat, lng, zoom } = computeCenter(points);
+  const coordsArray = JSON.stringify(points.map(p => [p.latitude, p.longitude]));
+  const firstPoint = points[0];
+  const lastPoint = points[points.length - 1];
 
-  return {
-    type: 'FeatureCollection',
-    features: [
-      // Main dashed trail line
-      {
-        type: 'Feature',
-        properties: {},
-        geometry: { type: 'LineString', coordinates },
-      },
-      // Arrow markers at intervals (every 3rd point for clarity)
-      ...points.filter((_, i) => i > 0 && i % 3 === 0).map((pt, idx) => ({
-        type: 'Feature',
-        properties: { index: idx },
-        geometry: { type: 'Point', coordinates: [pt.longitude, pt.latitude] },
-      })),
-    ],
-  };
-}
-
-// ── Map Trail layer (uses Mapbox if available) ───────────────────────────────
-function TrailMapboxLayer({
-  points,
-  autoFit,
-}: {
-  points: GpsPoint[];
-  autoFit: boolean;
-}) {
-  const [mapLoaded, setMapLoaded] = useState(false);
-  const mapRef = useRef<any>(null);
-  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
-
-  const bounds = computeBounds(points);
-  const geojson = buildTrailGeoJSON(points);
-  const trailCoords = points.map(p => [p.longitude, p.latitude]);
-
-  // Timeout fallback
-  useEffect(() => {
-    setMapLoaded(false);
-    if (timeoutRef.current) clearTimeout(timeoutRef.current);
-    timeoutRef.current = setTimeout(() => setMapLoaded(true), 8000);
-    return () => { if (timeoutRef.current) clearTimeout(timeoutRef.current); };
-  }, [points]);
-
-  const handleStyleLoad = () => {
-    if (timeoutRef.current) clearTimeout(timeoutRef.current);
-    setMapLoaded(true);
-
-    // Auto-fit to trail bounds
-    if (autoFit && mapRef.current && trailCoords.length > 0) {
-      setTimeout(() => {
-        try {
-          mapRef.current.fitBounds(
-            [bounds.center[0] - (bounds.padding / 111000), bounds.center[1] - (bounds.padding / 111000)],
-            [bounds.center[0] + (bounds.padding / 111000), bounds.center[1] + (bounds.padding / 111000)],
-            [60, 60, 60, 60],
-            1000
-          );
-        } catch (e) { console.warn('[TrailMap] fitBounds failed:', e); }
-      }, 300);
-    }
-  };
-
-  if (!mapboxLoaded) {
-    return <TrailFallback points={points} />;
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body, #map { width: 100%; height: 100%; background: #0F172A; }
+  .leaflet-control-attribution {
+    background: rgba(15,23,42,0.7) !important;
+    color: #64748B !important;
+    font-size: 9px !important;
   }
+  .leaflet-control-attribution a { color: #3B82F6 !important; }
+  .leaflet-control-zoom a {
+    background: rgba(15,23,42,0.92) !important;
+    color: #3B82F6 !important;
+    border-color: #1E293B !important;
+  }
+  .style-toggle {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    z-index: 1000;
+    background: rgba(15,23,42,0.92);
+    border: 1.5px solid #3B82F6;
+    border-radius: 8px;
+    padding: 6px 12px;
+    color: #3B82F6;
+    font-size: 12px;
+    font-weight: 700;
+    cursor: pointer;
+    font-family: -apple-system, sans-serif;
+  }
+  .info-badge {
+    position: absolute;
+    bottom: 8px;
+    left: 8px;
+    z-index: 1000;
+    background: rgba(15,23,42,0.85);
+    border-radius: 6px;
+    padding: 4px 8px;
+    color: #94A3B8;
+    font-size: 11px;
+    font-family: -apple-system, sans-serif;
+    pointer-events: none;
+  }
+  .endpoint-marker {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    border: 2.5px solid white;
+    font-size: 15px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.5);
+  }
+  .leaflet-popup-content-wrapper {
+    background: #1E293B;
+    color: #F1F5F9;
+    border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+    font-family: -apple-system, sans-serif;
+  }
+  .leaflet-popup-tip { background: #1E293B; }
+  .leaflet-popup-content { margin: 8px 12px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(function() {
+  var pts = ${coordsArray};
+  var currentStyle = '${initialStyle}';
 
-  return (
-    <MapView
-      ref={mapRef}
-      style={styles.map}
-      styleURL="mapbox://styles/mapbox/satellite-streets-v12"
-      surfaceView={true}
-      onStyleLoad={handleStyleLoad}
-      rotateEnabled={true}
-      pitchEnabled={true}
-      compassEnabled={true}
-      logoEnabled={false}
-      attributionEnabled={false}
-    >
-      <Camera
-        defaultSettings={{
-          centerCoordinate: bounds.center,
-          zoomLevel: 14,
-          pitch: 45,
-          bearing: 0,
-        }}
-      />
+  var map = L.map('map', { zoomControl: true, attributionControl: true })
+             .setView([${lat}, ${lng}], ${zoom});
 
-      {/* Dashed trail line */}
-      {geojson && (
-        <ShapeSource id="trail" shape={geojson.features[0]}>
-          <LineLayer
-            id="trail-line"
-            style={{
-              lineColor: '#3B82F6',
-              lineWidth: 4,
-              lineDasharray: [3, 2],
-              lineOpacity: 0.9,
-            }}
-          />
-        </ShapeSource>
-      )}
-
-      {/* Direction arrows (triangle markers on trail) */}
-      {points.map((pt, idx) => {
-        if (idx === 0) return null;
-        // Draw a small arrow marker every 3 points
-        if (idx % 3 !== 0) return null;
-        return (
-          <MarkerView
-            key={`arrow-${idx}`}
-            coordinate={[pt.longitude, pt.latitude]}
-            anchor={{ x: 0.5, y: 0.5 }}
-          >
-            <View style={arrowStyles.container}>
-              <View style={arrowStyles.triangle} />
-            </View>
-          </MarkerView>
-        );
-      })}
-
-      {/* Start marker (green) */}
-      {points.length > 0 && (
-        <MarkerView
-          coordinate={[points[0].longitude, points[0].latitude]}
-          anchor={{ x: 0.5, y: 0.5 }}
-        >
-          <View style={markerStyles.start}>
-            <Ionicons name="flag" size={22} color="white" />
-          </View>
-        </MarkerView>
-      )}
-
-      {/* End marker (red) */}
-      {points.length > 1 && (
-        <MarkerView
-          coordinate={[
-            points[points.length - 1].longitude,
-            points[points.length - 1].latitude,
-          ]}
-          anchor={{ x: 0.5, y: 0.5 }}
-        >
-          <View style={markerStyles.end}>
-            <Ionicons name="location" size={22} color="white" />
-          </View>
-        </MarkerView>
-      )}
-    </MapView>
+  var esriSat = L.tileLayer(
+    'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+    { maxZoom: 20, attribution: 'Esri, Maxar, Airbus' }
   );
+  var esriLabels = L.tileLayer(
+    'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
+    { maxZoom: 20, attribution: '' }
+  );
+  var osm = L.tileLayer(
+    'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+    { maxZoom: 19, subdomains: 'abc', attribution: '© OpenStreetMap contributors' }
+  );
+
+  function applyStyle(s) {
+    if (s === 'satellite') {
+      map.removeLayer(osm);
+      esriSat.addTo(map); esriLabels.addTo(map);
+      toggleBtn.textContent = '🛰 Satellite';
+    } else {
+      map.removeLayer(esriSat); map.removeLayer(esriLabels);
+      osm.addTo(map);
+      toggleBtn.textContent = '🗺 Streets';
+    }
+    currentStyle = s;
+  }
+
+  applyStyle(currentStyle);
+
+  var toggleBtn = document.createElement('button');
+  toggleBtn.className = 'style-toggle';
+  toggleBtn.textContent = currentStyle === 'satellite' ? '🛰 Satellite' : '🗺 Streets';
+  document.body.appendChild(toggleBtn);
+  toggleBtn.onclick = function() { applyStyle(currentStyle === 'satellite' ? 'streets' : 'satellite'); };
+
+  var badge = document.createElement('div');
+  badge.className = 'info-badge';
+  badge.textContent = pts.length + ' GPS points';
+  document.body.appendChild(badge);
+
+  if (pts.length < 2) { return; }
+
+  // Trail polyline
+  var polyline = L.polyline(pts, {
+    color: '#3B82F6',
+    weight: 4,
+    opacity: 0.9,
+    dashArray: '10, 6',
+    lineJoin: 'round',
+  }).addTo(map);
+
+  // Direction arrows every ~5 points
+  for (var i = 5; i < pts.length; i += Math.max(5, Math.floor(pts.length / 10))) {
+    var prev = pts[i-1], curr = pts[i];
+    var angle = Math.atan2(curr[1] - prev[1], curr[0] - prev[0]) * 180 / Math.PI;
+    var arrowEl = document.createElement('div');
+    arrowEl.style.cssText = 'width:12px;height:12px;background:#3B82F6;clip-path:polygon(50% 0%,100% 100%,0% 100%);transform:rotate(' + (angle - 90) + 'deg);opacity:0.85;';
+    L.marker([curr[0], curr[1]], {
+      icon: L.divIcon({ html: arrowEl.outerHTML, className: '', iconSize: [12,12], iconAnchor: [6,6] }),
+      interactive: false,
+    }).addTo(map);
+  }
+
+  // Start marker (green flag)
+  var startEl = document.createElement('div');
+  startEl.className = 'endpoint-marker';
+  startEl.style.background = '#22C55E';
+  startEl.textContent = '🚩';
+  var startIcon = L.divIcon({ html: startEl.outerHTML, className: '', iconSize: [28,28], iconAnchor: [14,14], popupAnchor: [0,-16] });
+  L.marker([pts[0][0], pts[0][1]], { icon: startIcon })
+   .bindPopup('<b>Start</b>${firstPoint?.timestamp ? '<br><span style="color:#94A3B8">' + new Date(firstPoint.timestamp).toLocaleString() + '</span>' : ''}')
+   .addTo(map);
+
+  // End marker (red pin)
+  var endEl = document.createElement('div');
+  endEl.className = 'endpoint-marker';
+  endEl.style.background = '#EF4444';
+  endEl.textContent = '📍';
+  var endIdx = pts.length - 1;
+  var endIcon = L.divIcon({ html: endEl.outerHTML, className: '', iconSize: [28,28], iconAnchor: [14,14], popupAnchor: [0,-16] });
+  L.marker([pts[endIdx][0], pts[endIdx][1]], { icon: endIcon })
+   .bindPopup('<b>End</b>${lastPoint?.timestamp ? '<br><span style="color:#94A3B8">' + new Date(lastPoint.timestamp).toLocaleString() + '</span>' : ''}')
+   .addTo(map);
+
+  // Fit bounds to trail
+  setTimeout(function() {
+    try { map.fitBounds(polyline.getBounds(), { padding: [40, 40], maxZoom: 16 }); } catch(e) {}
+  }, 200);
+
+})();
+</script>
+</body>
+</html>`;
 }
 
-// ── Web / Fallback trail (static map + coordinate list) ─────────────────────
-function TrailFallback({ points }: { points: GpsPoint[] }) {
-  const formatCoord = (pt: GpsPoint) => `${pt.latitude.toFixed(6)}, ${pt.longitude.toFixed(6)}`;
+// ── Coordinate fallback list ──────────────────────────────────────────────────
 
+function TrailFallback({ points }: { points: GpsPoint[] }) {
   return (
     <View style={styles.fallback}>
-      <View style={styles.fallbackIcon}>
-        <Ionicons name="navigate" size={60} color="#3B82F6" />
-      </View>
-      <Text style={styles.fallbackTitle}>Trail Map</Text>
-      <Text style={styles.fallbackSub}>{points.length} GPS points</Text>
-
-      <View style={styles.fallbackList}>
-        {points.map((pt, i) => (
-          <View key={i} style={styles.fallbackRow}>
-            <View style={[styles.fallbackDot, i === 0 && styles.fallbackDotStart, i === points.length - 1 && styles.fallbackDotEnd]} />
-            <View style={styles.fallbackContent}>
-              <Text style={styles.fallbackCoords}>{formatCoord(pt)}</Text>
-              {pt.timestamp && (
-                <Text style={styles.fallbackTime}>
-                  {new Date(pt.timestamp).toLocaleString()}
-                </Text>
-              )}
-            </View>
-            <TouchableOpacity
-              onPress={() => Linking.openURL(`https://www.google.com/maps?q=${pt.latitude},${pt.longitude}`)}
-              style={styles.fallbackMapBtn}
-            >
-              <Ionicons name="map" size={16} color="#3B82F6" />
-            </TouchableOpacity>
-          </View>
-        ))}
-      </View>
+      <Ionicons name="navigate" size={48} color="#3B82F6" />
+      <Text style={styles.fallbackTitle}>Trail — {points.length} GPS points</Text>
+      {points.slice(0, 8).map((pt, i) => (
+        <TouchableOpacity
+          key={i}
+          style={styles.fallbackRow}
+          onPress={() => Linking.openURL(`https://www.google.com/maps?q=${pt.latitude},${pt.longitude}`)}
+        >
+          <View style={[styles.dot, i === 0 && styles.dotStart, i === points.length - 1 && styles.dotEnd]} />
+          <Text style={styles.fallbackCoord}>{pt.latitude.toFixed(5)}, {pt.longitude.toFixed(5)}</Text>
+          {pt.timestamp && (
+            <Text style={styles.fallbackTime}>{new Date(pt.timestamp).toLocaleTimeString()}</Text>
+          )}
+        </TouchableOpacity>
+      ))}
+      {points.length > 8 && (
+        <Text style={styles.moreText}>+ {points.length - 8} more points</Text>
+      )}
     </View>
   );
 }
 
-// ── Web trail with Leaflet (if on web and we can use WebView) ─────────────────
-function WebLeafletTrail({ points }: { points: GpsPoint[] }) {
-  if (points.length < 2) return <TrailFallback points={points} />;
+// ── Main component ───────────────────────────────────────────────────────────
 
-  const bounds = computeBounds(points);
-  const padding = bounds.padding / 111000;
+export function TrailMapModal({ visible, onClose, points, title, subtitle }: TrailMapModalProps) {
+  const [initialStyle] = useState<'satellite' | 'streets'>('satellite');
+  const [isLoading, setIsLoading] = useState(true);
 
-  // Build polyline encoded coordinates for URL
-  const encodedPath = points
-    .map(p => `${p.latitude},${p.longitude}`)
-    .join('|');
-
-  const mapsUrl = `https://www.google.com/maps/dir/?api=1&travelmode=driving&dir_action=interpolate`;
-
-  return (
-    <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#0F172A' }}>
-      <Ionicons name="map" size={80} color="#3B82F6" />
-      <Text style={{ color: '#fff', fontSize: 18, marginTop: 16, fontWeight: '600' }}>
-        Trail Map — {points.length} points
-      </Text>
-      <Text style={{ color: '#94A3B8', fontSize: 14, marginTop: 8 }}>
-        {points[0].latitude.toFixed(4)}, {points[0].longitude.toFixed(4)}
-        {' → '}
-        {points[points.length - 1].latitude.toFixed(4)}, {points[points.length - 1].longitude.toFixed(4)}
-      </Text>
-
-      <TouchableOpacity
-        style={styles.openMapsBtn}
-        onPress={() => {
-          const url = `https://www.google.com/maps/dir/${points.map(p => `${p.latitude},${p.longitude}`).join('/')}`;
-          Linking.openURL(url).catch(() => {});
-        }}
-      >
-        <Ionicons name="open-outline" size={18} color="#fff" />
-        <Text style={styles.openMapsBtnText}>Open in Google Maps</Text>
-      </TouchableOpacity>
-
-      <View style={{ marginTop: 24, paddingHorizontal: 16, width: '100%' }}>
-        {points.slice(0, 5).map((pt, i) => (
-          <View key={i} style={styles.fallbackRow}>
-            <View style={[styles.fallbackDot, i === 0 && styles.fallbackDotStart, i === points.length - 1 && styles.fallbackDotEnd]} />
-            <View style={styles.fallbackContent}>
-              <Text style={styles.fallbackCoords}>{pt.latitude.toFixed(5)}, {pt.longitude.toFixed(5)}</Text>
-              {pt.timestamp && <Text style={styles.fallbackTime}>{new Date(pt.timestamp).toLocaleTimeString()}</Text>}
-            </View>
-          </View>
-        ))}
-        {points.length > 5 && (
-          <Text style={{ color: '#64748B', textAlign: 'center', marginTop: 8 }}>
-            + {points.length - 5} more points
-          </Text>
-        )}
-      </View>
-    </View>
-  );
-}
-
-// ── Main TrailMapModal export ────────────────────────────────────────────────
-export function TrailMapModal({
-  visible,
-  onClose,
-  points,
-  title = 'Movement Trail',
-  subtitle,
-}: TrailMapModalProps) {
-  const [mapLoading, setMapLoading] = useState(true);
-  const isMountedRef = useRef(true);
-
-  useEffect(() => {
-    isMountedRef.current = true;
-    return () => { isMountedRef.current = false; };
-  }, []);
-
-  useEffect(() => {
-    if (!visible) { setMapLoading(true); return; }
-    const t = setTimeout(() => {
-      if (isMountedRef.current) setMapLoading(false);
-    }, 6000);
-    return () => clearTimeout(t);
-  }, [visible]);
-
-  const openExternalMaps = () => {
-    if (!points || points.length === 0) return;
-    const first = points[0];
-    const last  = points[points.length - 1];
-    const waypoints = points.map(p => `${p.latitude},${p.longitude}`).join('/');
-    const url = `https://www.google.com/maps/dir/${waypoints}`;
-    Linking.openURL(url).catch(() => {
-      Linking.openURL(`https://www.google.com/maps?q=${first.latitude},${first.longitude}`);
-    });
-  };
-
-  // Web: show Leaflet-style fallback
-  if (Platform.OS === 'web') {
-    return (
-      <Modal visible={visible} animationType="slide" presentationStyle="fullScreen" onRequestClose={onClose}>
-        <View style={styles.container}>
-          <View style={styles.header}>
-            <TouchableOpacity onPress={onClose} style={styles.closeButton}>
-              <Ionicons name="close" size={28} color="#fff" />
-            </TouchableOpacity>
-            <View style={styles.headerInfo}>
-              <Text style={styles.headerTitle}>{title}</Text>
-              {subtitle && <Text style={styles.headerSubtitle}>{subtitle}</Text>}
-            </View>
-            <TouchableOpacity onPress={openExternalMaps} style={styles.closeButton}>
-              <Ionicons name="open-outline" size={24} color="#3B82F6" />
-            </TouchableOpacity>
-          </View>
-          <WebLeafletTrail points={points} />
-        </View>
-      </Modal>
+  const openExternalMaps = useCallback(() => {
+    if (!points.length) return;
+    const { latitude, longitude } = points[0];
+    const url = Platform.OS === 'ios'
+      ? `maps:?q=${encodeURIComponent(title || 'Trail')}&ll=${latitude},${longitude}`
+      : `geo:${latitude},${longitude}?q=${latitude},${longitude}(${encodeURIComponent(title || 'Trail')})`;
+    Linking.openURL(url).catch(() =>
+      Linking.openURL(`https://www.google.com/maps?q=${latitude},${longitude}`)
     );
-  }
+  }, [points, title]);
 
-  // Native: show Mapbox trail
+  const html = points.length >= 2 ? buildTrailHTML(points, initialStyle) : null;
+
   return (
     <Modal visible={visible} animationType="slide" presentationStyle="fullScreen" onRequestClose={onClose}>
       <View style={styles.container}>
+        {/* Header */}
         <View style={styles.header}>
-          <TouchableOpacity onPress={onClose} style={styles.closeButton}>
-            <Ionicons name="close" size={28} color="#fff" />
+          <TouchableOpacity onPress={onClose} style={styles.headerBtn}>
+            <Ionicons name="close" size={26} color="#fff" />
           </TouchableOpacity>
           <View style={styles.headerInfo}>
-            <Text style={styles.headerTitle}>{title}</Text>
-            {subtitle && <Text style={styles.headerSubtitle}>{subtitle}</Text>}
+            <Text style={styles.headerTitle}>{title || 'Movement Trail'}</Text>
+            {subtitle
+              ? <Text style={styles.headerSub}>{subtitle}</Text>
+              : <Text style={styles.headerSub}>{points.length} GPS points</Text>
+            }
           </View>
-          <TouchableOpacity onPress={openExternalMaps} style={styles.closeButton}>
-            <Ionicons name="open-outline" size={24} color="#3B82F6" />
+          <TouchableOpacity onPress={openExternalMaps} style={styles.headerBtn}>
+            <Ionicons name="open-outline" size={22} color="#3B82F6" />
           </TouchableOpacity>
         </View>
 
-        {/* Legend bar */}
-        <View style={styles.legendBar}>
-          <View style={styles.legendItem}>
-            <View style={[styles.legendDot, { backgroundColor: '#10B981' }]} />
-            <Text style={styles.legendText}>Start</Text>
-          </View>
-          <View style={styles.legendItem}>
-            <View style={[styles.legendLine]} />
-            <Text style={styles.legendText}>Trail</Text>
-          </View>
-          <View style={styles.legendItem}>
-            <View style={[styles.legendDot, { backgroundColor: '#EF4444' }]} />
-            <Text style={styles.legendText}>End</Text>
-          </View>
-          <Text style={styles.legendCount}>{points.length} points</Text>
-        </View>
-
-        <View style={styles.mapContainer}>
-          {mapLoading && (
-            <View style={styles.loadingOverlay}>
-              <ActivityIndicator size="large" color="#3B82F6" />
-              <Text style={styles.loadingText}>Loading trail map…</Text>
-            </View>
-          )}
-
-          {mapboxLoaded ? (
-            <TrailMapboxLayer points={points} autoFit={true} />
+        {/* Map or fallback */}
+        <View style={styles.mapWrapper}>
+          {points.length >= 2 && html ? (
+            <>
+              {isLoading && (
+                <View style={styles.loadingOverlay}>
+                  <ActivityIndicator size="large" color="#3B82F6" />
+                  <Text style={styles.loadingText}>Loading satellite view...</Text>
+                </View>
+              )}
+              <WebView
+                source={{ html }}
+                style={styles.webview}
+                originWhitelist={['*']}
+                javaScriptEnabled
+                domStorageEnabled
+                scrollEnabled={false}
+                bounces={false}
+                mixedContentMode="always"
+                onLoadEnd={() => setIsLoading(false)}
+                onError={() => setIsLoading(false)}
+              />
+            </>
           ) : (
             <TrailFallback points={points} />
           )}
         </View>
 
-        {/* Bottom info */}
-        {points.length > 0 && (
-          <View style={styles.bottomInfo}>
-            <View style={styles.coordsCard}>
-              <View style={styles.coordRow}>
-                <View style={[styles.coordDot, { backgroundColor: '#10B981' }]} />
-                <View>
-                  <Text style={styles.coordLabel}>Start</Text>
-                  <Text style={styles.coordValue}>
-                    {points[0].latitude.toFixed(6)}, {points[0].longitude.toFixed(6)}
-                  </Text>
-                </View>
-              </View>
-
-              <View style={styles.coordDivider} />
-
-              <View style={styles.coordRow}>
-                <View style={[styles.coordDot, { backgroundColor: '#EF4444' }]} />
-                <View>
-                  <Text style={styles.coordLabel}>End</Text>
-                  <Text style={styles.coordValue}>
-                    {points[points.length - 1].latitude.toFixed(6)}, {points[points.length - 1].longitude.toFixed(6)}
-                  </Text>
-                </View>
-              </View>
-
-              <TouchableOpacity onPress={openExternalMaps} style={styles.openMapsCircle}>
-                <Ionicons name="navigate" size={20} color="#3B82F6" />
-              </TouchableOpacity>
+        {/* Stats bar */}
+        {points.length >= 2 && (
+          <View style={styles.statsBar}>
+            <View style={styles.statItem}>
+              <Ionicons name="location" size={16} color="#3B82F6" />
+              <Text style={styles.statLabel}>Start</Text>
+              <Text style={styles.statValue}>
+                {points[0].latitude.toFixed(4)}, {points[0].longitude.toFixed(4)}
+              </Text>
+            </View>
+            <View style={styles.statDivider} />
+            <View style={styles.statItem}>
+              <Ionicons name="flag" size={16} color="#EF4444" />
+              <Text style={styles.statLabel}>End</Text>
+              <Text style={styles.statValue}>
+                {points[points.length-1].latitude.toFixed(4)}, {points[points.length-1].longitude.toFixed(4)}
+              </Text>
             </View>
           </View>
         )}
@@ -487,99 +353,50 @@ export function TrailMapModal({
   );
 }
 
-// ── Styles ────────────────────────────────────────────────────────────────────
 const styles = StyleSheet.create({
-  container:       { flex: 1, backgroundColor: '#0F172A' },
+  container: { flex: 1, backgroundColor: '#0F172A' },
   header: {
-    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
-    paddingHorizontal: 16, paddingTop: Platform.OS === 'ios' ? 50 : 16, paddingBottom: 12,
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    paddingHorizontal: 12,
+    paddingTop: Platform.OS === 'ios' ? 50 : 16,
+    paddingBottom: 14,
     backgroundColor: '#1E293B',
-    borderBottomWidth: 1, borderBottomColor: '#334155',
   },
-  closeButton:  { width: 44, height: 44, justifyContent: 'center', alignItems: 'center' },
-  headerInfo:   { flex: 1, alignItems: 'center' },
-  headerTitle:  { fontSize: 18, fontWeight: '600', color: '#fff' },
-  headerSubtitle: { fontSize: 14, color: '#94A3B8', marginTop: 2 },
-
-  legendBar: {
-    flexDirection: 'row', alignItems: 'center', gap: 16,
-    paddingHorizontal: 16, paddingVertical: 8,
-    backgroundColor: '#1E293B',
-    borderBottomWidth: 1, borderBottomColor: '#334155',
-  },
-  legendItem:   { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  legendDot:    { width: 10, height: 10, borderRadius: 5 },
-  legendLine:   { width: 20, height: 3, backgroundColor: '#3B82F6', borderRadius: 2 },
-  legendText:   { color: '#94A3B8', fontSize: 12 },
-  legendCount:  { color: '#3B82F6', fontSize: 12, fontWeight: '700', marginLeft: 'auto' },
-
-  mapContainer:  { flex: 1, position: 'relative' },
-  map:           { flex: 1 },
+  headerBtn: { width: 44, height: 44, justifyContent: 'center', alignItems: 'center' },
+  headerInfo: { flex: 1, alignItems: 'center' },
+  headerTitle: { fontSize: 17, fontWeight: '700', color: '#fff' },
+  headerSub: { fontSize: 12, color: '#64748B', marginTop: 2 },
+  mapWrapper: { flex: 1, position: 'relative' },
+  webview: { flex: 1, backgroundColor: '#0F172A' },
   loadingOverlay: {
-    ...StyleSheet.absoluteFillObject, backgroundColor: '#0F172A',
-    justifyContent: 'center', alignItems: 'center', zIndex: 10,
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: '#0F172A',
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 10,
   },
-  loadingText:  { color: '#94A3B8', marginTop: 12, fontSize: 14 },
-
-  fallback:     { flex: 1, paddingHorizontal: 16, paddingTop: 24 },
-  fallbackIcon: { alignItems: 'center', paddingVertical: 24 },
-  fallbackTitle:{ color: '#fff', fontSize: 20, fontWeight: '700', textAlign: 'center' },
-  fallbackSub:  { color: '#94A3B8', fontSize: 14, textAlign: 'center', marginTop: 4 },
-  fallbackList: { marginTop: 24, gap: 8 },
-  fallbackRow:  { flexDirection: 'row', alignItems: 'center', gap: 12, backgroundColor: '#1E293B', padding: 12, borderRadius: 8 },
-  fallbackDot:  { width: 10, height: 10, borderRadius: 5, backgroundColor: '#334155' },
-  fallbackDotStart: { backgroundColor: '#10B981' },
-  fallbackDotEnd:   { backgroundColor: '#EF4444' },
-  fallbackContent:  { flex: 1 },
-  fallbackCoords:    { color: '#E2E8F0', fontSize: 13, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
-  fallbackTime:      { color: '#64748B', fontSize: 11, marginTop: 2 },
-  fallbackMapBtn: { padding: 6 },
-
-  openMapsBtn: {
-    flexDirection: 'row', alignItems: 'center', gap: 8,
-    backgroundColor: '#3B82F6', paddingVertical: 12, paddingHorizontal: 24,
-    borderRadius: 8, marginTop: 24,
+  loadingText: { color: '#94A3B8', marginTop: 12, fontSize: 13 },
+  statsBar: {
+    flexDirection: 'row',
+    backgroundColor: '#1E293B',
+    padding: 14,
+    paddingBottom: Platform.OS === 'ios' ? 32 : 14,
+    gap: 12,
   },
-  openMapsBtnText: { color: '#fff', fontWeight: '600', fontSize: 14 },
-
-  bottomInfo:   { backgroundColor: '#1E293B', padding: 16, paddingBottom: Platform.OS === 'ios' ? 34 : 16 },
-  coordsCard:   { flexDirection: 'row', alignItems: 'center', gap: 16, backgroundColor: '#0F172A', padding: 16, borderRadius: 12 },
-  coordRow:     { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 8 },
-  coordDot:     { width: 12, height: 12, borderRadius: 6 },
-  coordLabel:   { color: '#64748B', fontSize: 11 },
-  coordValue:   { color: '#E2E8F0', fontSize: 12, marginTop: 2, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
-  coordDivider: { width: 1, height: 40, backgroundColor: '#334155' },
-  openMapsCircle:{ width: 44, height: 44, borderRadius: 22, backgroundColor: '#3B82F620', justifyContent: 'center', alignItems: 'center' },
+  statItem: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 6 },
+  statLabel: { color: '#64748B', fontSize: 11, fontWeight: '600' },
+  statValue: { color: '#94A3B8', fontSize: 11, flex: 1 },
+  statDivider: { width: 1, backgroundColor: '#334155' },
+  // Fallback styles
+  fallback: { flex: 1, padding: 20, alignItems: 'center', backgroundColor: '#0F172A' },
+  fallbackTitle: { color: '#94A3B8', fontSize: 15, fontWeight: '600', marginTop: 12, marginBottom: 16 },
+  fallbackRow: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 8, width: '100%', borderBottomWidth: 1, borderBottomColor: '#1E293B' },
+  dot: { width: 10, height: 10, borderRadius: 5, backgroundColor: '#3B82F6' },
+  dotStart: { backgroundColor: '#22C55E' },
+  dotEnd: { backgroundColor: '#EF4444' },
+  fallbackCoord: { flex: 1, color: '#94A3B8', fontSize: 12, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
+  fallbackTime: { color: '#475569', fontSize: 11 },
+  moreText: { color: '#475569', fontSize: 12, marginTop: 12 },
 });
 
-// ── Arrow marker styles ───────────────────────────────────────────────────────
-const arrowStyles = StyleSheet.create({
-  container: { width: 20, height: 20, justifyContent: 'center', alignItems: 'center' },
-  triangle:   {
-    width: 0, height: 0,
-    borderLeftWidth: 7, borderRightWidth: 7,
-    borderTopWidth: 12,
-    borderLeftColor: 'transparent', borderRightColor: 'transparent',
-    borderTopColor: '#3B82F6',
-  },
-});
-
-// ── Start / End marker styles ─────────────────────────────────────────────────
-const markerStyles = StyleSheet.create({
-  start: {
-    backgroundColor: '#10B981',
-    width: 32, height: 32, borderRadius: 16,
-    justifyContent: 'center', alignItems: 'center',
-    borderWidth: 3, borderColor: 'white',
-    shadowColor: '#000', shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.4, shadowRadius: 4, elevation: 6,
-  },
-  end: {
-    backgroundColor: '#EF4444',
-    width: 32, height: 32, borderRadius: 16,
-    justifyContent: 'center', alignItems: 'center',
-    borderWidth: 3, borderColor: 'white',
-    shadowColor: '#000', shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.4, shadowRadius: 4, elevation: 6,
-  },
-});
+export default TrailMapModal;
