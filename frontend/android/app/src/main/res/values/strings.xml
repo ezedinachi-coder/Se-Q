@@ -2,9 +2,27 @@
   <string name="app_name">Se-Q</string>
   <string name="expo_system_ui_user_interface_style" translatable="false">dark</string>
   <string name="expo_splash_screen_resize_mode" translatable="false">contain</string>
+
   <!--
-    Mapbox token entry REMOVED — @rnmapbox/maps is no longer a dependency.
-    Maps are now rendered via Google Maps JavaScript API inside react-native-webview.
-    No native string resource is required.
+    Google Maps API key — read by the native Google Maps Android SDK at startup.
+    react-native-maps requires this resource to be present.
+
+    HOW TO SET:
+      Replace PASTE_YOUR_GOOGLE_MAPS_API_KEY_HERE with your AIza... key.
+      Get your key at: https://console.cloud.google.com
+        → APIs & Services → Credentials → Create API Key
+        → Enable "Maps SDK for Android"
+        → Restrict the key to com.seq.app (Android app restriction)
+
+    The same key used for the JavaScript API (eas.json GOOGLE_MAPS_API_KEY)
+    works here if you leave the API restrictions set to "Maps SDK for Android"
+    AND "Maps JavaScript API". Or use the same unrestricted key for simplicity
+    and add restrictions later.
+
+    DO NOT commit a real key to git — use a git-ignored local override or
+    inject via CI. For EAS builds, use an EAS secret and a config plugin
+    to write it here at build time, OR simply paste it once and keep this
+    file out of public repositories.
   -->
+  <string name="google_maps_api_key" translatable="false">PASTE_YOUR_GOOGLE_MAPS_API_KEY_HERE</string>
 </resources>
