@@ -24,7 +24,7 @@ import {
   requestPostNotificationsPermission,
 } from '../utils/nativePanicBridge';
 import BACKEND_URL from '../utils/config';
-import { getAuthToken } from '../utils/auth';
+import { getAuthToken, authEvents } from '../utils/auth';
 import * as Location from 'expo-location';
 import { getLocation } from '../utils/getLocation';
 import { AudioManager } from '../utils/AudioManager';
@@ -187,10 +187,29 @@ function AppContent() {
   }, []);
 
   // ── Load user role ─────────────────────────────────────────────────────────
+  // FIX GAP-4: Two complementary triggers — segment changes AND auth events.
+  //
+  // The segment-change poll was the only trigger before this fix. It silently
+  // skipped the AudioManager reset whenever logout navigated back to the same
+  // /auth/login segment (session expiry re-login), because segments.join('/')
+  // didn't change so the effect dependency didn't fire.
+  //
+  // authEvents.on('roleChange') fires from saveAuthData() and clearAuthData()
+  // regardless of navigation — it is the authoritative source of truth for
+  // role transitions and makes the segment poll a secondary safety net only.
 
   useEffect(() => {
+    // Initial read on mount / segment change (keeps backward compat)
     AsyncStorage.getItem('user_role').then(role => setUserRole(role));
   }, [segments.join('/')]);
+
+  useEffect(() => {
+    // Event-driven update — fires on every login and logout
+    const unsub = authEvents.on('roleChange', (role) => {
+      setUserRole(role);
+    });
+    return unsub; // cleanup on unmount
+  }, []);
 
   // ── Shake detection (foreground) ───────────────────────────────────────────
 
