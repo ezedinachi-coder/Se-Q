@@ -89,16 +89,24 @@ export default function SecurityPanics() {
     return `${BACKEND_URL}${url.startsWith('/') ? '' : '/'}${url}`;
   };
 
-  const stopAudio = async () => {
+  const stopAudio = async (force = false) => {
     if (soundRef.current) {
       try { await soundRef.current.stopAsync(); } catch (_) {}
       try { await soundRef.current.unloadAsync(); } catch (_) {}
       soundRef.current = null;
     }
-    // FIX: Reset AudioSession to safe defaults after playback ends.
-    // Uses centralized AudioManager helper for consistent behavior.
-    // FIX SOUND-CLASH: release focus via AudioManager with the correct tag.
-    await AudioManager.releaseFocus('security_panics_audio');
+    // FIX GAP-3: Use releaseFocus() for normal in-session stops (toggle off,
+    // natural finish). Use stopAll() for unmount / navigation-away so a
+    // tag-mismatch never silently leaves audio bleeding into the next session.
+    // If a higher-priority sound (e.g. a live alarm from security/home) evicted
+    // 'security_panics_audio' from activeSound, releaseFocus() sees a mismatch
+    // and does nothing — but stopAll() is unconditional and always leaves the
+    // singleton clean before logout.
+    if (force) {
+      await AudioManager.stopAll();
+    } else {
+      await AudioManager.releaseFocus('security_panics_audio');
+    }
     setPlayingId(null);
     setAudioLoading(null);
   };
@@ -156,12 +164,13 @@ export default function SecurityPanics() {
   }, []);
 
   // Cleanup ambient audio on unmount
-  useEffect(() => { return () => { stopAudio(); }; }, []);
+  // FIX GAP-3: force=true so stopAll() is used on unmount (tag-mismatch safe)
+  useEffect(() => { return () => { stopAudio(true); }; }, []);
 
   // Stop ambient audio when navigating away
   useFocusEffect(
     useCallback(() => {
-      return () => { stopAudio(); };
+      return () => { stopAudio(true); }; // FIX GAP-3: force stopAll on blur
     }, [])
   );
 
