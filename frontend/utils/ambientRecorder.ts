@@ -68,24 +68,50 @@ const RECORDER_TAG = 'ambient_recorder';
 
 export interface AmbientCapture {
   attachToPanic: (panicId: string, authToken: string) => void;
+  /**
+   * FIX GAP-2: Cancel the in-flight recording immediately and release
+   * AudioManager focus. Call this on panic abort, 401 logout, or any
+   * unmount that happens before the 30 s capture completes.
+   *
+   * Without this, the _record() async function kept running for up to
+   * 35 s after the civil user logged out. When it finally resolved, it
+   * called AudioManager.releaseFocus('ambient_recorder') on the new
+   * session's singleton — which called _restoreToStandby() and silently
+   * overwrote whatever audio mode (e.g. ALERT for a security alarm) the
+   * new role had set.
+   */
+  cancel: () => void;
 }
 
 export function beginAmbientCapture(): AmbientCapture {
   let resolveUri: (uri: string | null) => void;
   const uriPromise = new Promise<string | null>(res => { resolveUri = res; });
 
-  _record().then(uri => resolveUri(uri)).catch(() => resolveUri(null));
+  // Shared cancellation flag — _record() polls this and exits early.
+  const cancelSignal = { cancelled: false };
+
+  _record(cancelSignal).then(uri => resolveUri(uri)).catch(() => resolveUri(null));
 
   return {
     attachToPanic(panicId: string, authToken: string): void {
       _uploadWhenReady(uriPromise, panicId, authToken);
+    },
+    cancel(): void {
+      // Flip the flag so _record() stops at its next checkpoint.
+      cancelSignal.cancelled = true;
+      // Release focus immediately so the new session is not blocked.
+      // If _record() hasn't acquired focus yet this is a no-op (safe).
+      // If it already released focus (recording finished) this is also a no-op.
+      AudioManager.releaseFocus(RECORDER_TAG).catch(() => {});
+      // Resolve the URI promise with null so attachToPanic silently exits.
+      resolveUri(null);
     },
   };
 }
 
 // ── Internal ──────────────────────────────────────────────────────────────────
 
-async function _record(): Promise<string | null> {
+async function _record(cancelSignal: { cancelled: boolean }): Promise<string | null> {
   let recording: Audio.Recording | null = null;
 
   try {
@@ -95,6 +121,9 @@ async function _record(): Promise<string | null> {
       console.log('[AmbientRecorder] Mic permission not granted — skipping capture');
       return null;
     }
+
+    // FIX GAP-2: Check cancellation before acquiring any OS resource.
+    if (cancelSignal.cancelled) return null;
 
     // FIX BUG-08: requestFocus(RECORDING) sets allowsRecordingIOS:true and
     // staysActiveInBackground:true with the highest priority (100). Any
@@ -108,6 +137,13 @@ async function _record(): Promise<string | null> {
       return null;
     }
 
+    // FIX GAP-2: Check again after the async focus request — cancel() may
+    // have fired while we were awaiting requestFocus().
+    if (cancelSignal.cancelled) {
+      await AudioManager.releaseFocus(RECORDER_TAG);
+      return null;
+    }
+
     // ── Start recording ─────────────────────────────────────────────────────
     const { recording: rec } = await Audio.Recording.createAsync(
       AMBIENT_RECORDING_OPTIONS,
@@ -116,15 +152,26 @@ async function _record(): Promise<string | null> {
     );
     recording = rec;
 
-    // ── Wait 30 s with hard timeout safety net ───────────────────────────────
+    // FIX GAP-2: Race the two duration timeouts against a cancellation
+    // promise. cancel() resolves cancelSignal.cancelled=true but we still
+    // need an actual Promise to race. We achieve this by polling via a
+    // small wrapper that resolves as soon as the flag is set.
+    const cancelPromise = new Promise<void>(resolve => {
+      const id = setInterval(() => {
+        if (cancelSignal.cancelled) { clearInterval(id); resolve(); }
+      }, 200);
+    });
+
+    // ── Wait 30 s (or cancel / hard-timeout) ────────────────────────────────
     await Promise.race([
       new Promise<void>(resolve => setTimeout(resolve, CAPTURE_DURATION_MS)),
       new Promise<void>(resolve => setTimeout(resolve, HARD_TIMEOUT_MS)),
+      cancelPromise,
     ]);
 
     // ── Stop and get URI ────────────────────────────────────────────────────
     await recording.stopAndUnloadAsync();
-    const uri = recording.getURI() ?? null;
+    const uri = cancelSignal.cancelled ? null : (recording.getURI() ?? null);
     recording = null;
 
     // FIX BUG-08: releaseFocus restores the session through the manager's

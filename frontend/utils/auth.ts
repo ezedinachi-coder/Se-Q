@@ -15,7 +15,34 @@
  */
 
 import AsyncStorage from './asyncStorageShim';
-import { Audio, InterruptionModeAndroid, InterruptionModeIOS } from 'expo-av';
+import { AudioManager } from './AudioManager';
+
+// ── Auth event bus ────────────────────────────────────────────────────────────
+// FIX GAP-4: _layout.tsx previously polled user_role from AsyncStorage only
+// when route segments changed. If a logout navigated back to the SAME segment
+// (e.g. /auth/login → /auth/login on session expiry), segments.join('/') did
+// not change, setUserRole was never called, and the AudioManager reset effect
+// never fired — leaving stale audio state from the previous role active.
+//
+// Solution: a lightweight event emitter that fires 'roleChange' whenever
+// saveAuthData() or clearAuthData() completes. _layout.tsx subscribes to this
+// and calls setUserRole() directly, independently of segment changes.
+type AuthEventType = 'roleChange';
+type AuthListener = (role: string | null) => void;
+
+const _listeners: Map<AuthEventType, Set<AuthListener>> = new Map([
+  ['roleChange', new Set()],
+]);
+
+export const authEvents = {
+  on(event: AuthEventType, fn: AuthListener): () => void {
+    _listeners.get(event)!.add(fn);
+    return () => _listeners.get(event)!.delete(fn);
+  },
+  emit(event: AuthEventType, role: string | null): void {
+    _listeners.get(event)!.forEach(fn => fn(role));
+  },
+};
 
 const AUTH_TOKEN_KEY  = 'auth_token';
 const USER_ID_KEY     = 'user_id';
@@ -54,6 +81,7 @@ export const saveAuthData = async (data: {
       [IS_PREMIUM_KEY,  String(data.is_premium || false)],
       [USER_EMAIL_KEY,  data.email || ''],
     ]);
+    authEvents.emit('roleChange', data.role); // FIX GAP-4: notify _layout.tsx
     return true;
   } catch (error) {
     console.error('[Auth] Failed to save auth data:', error);
@@ -75,19 +103,16 @@ export const clearAuthData = async (): Promise<boolean> => {
   try {
     const token = await getAuthToken();
 
-    // Reset audio session BEFORE clearing auth
+    // FIX GAP-1: Stop all audio through the singleton so activeSound,
+    // currentPriority, and the OS mode are ALL reset atomically before
+    // the next session starts. The previous pattern called
+    // Audio.setAudioModeAsync() directly, which changed the OS mode but
+    // left AudioManager.activeSound populated — the orphan sound kept
+    // playing and its onPlaybackStatusUpdate callback later called
+    // _restoreToStandby(), overwriting the new session's audio mode.
     try {
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: false,
-        playsInSilentModeIOS: false,
-        staysActiveInBackground: false,
-        shouldDuckAndroid: true,
-        playThroughEarpieceAndroid: false,
-        // FIX: use proper enum values, never raw integer 0 (BUG-05)
-        interruptionModeIOS: InterruptionModeIOS.DoNotMix,
-        interruptionModeAndroid: InterruptionModeAndroid.DoNotMix,
-      });
-      console.log('[Auth] Audio session reset on logout');
+      await AudioManager.stopAll();
+      console.log('[Auth] AudioManager fully stopped on logout');
     } catch (_) {}
 
     if (token) {
@@ -120,6 +145,7 @@ export const clearAuthData = async (): Promise<boolean> => {
       ...SESSION_STATE_KEYS,
     ]);
 
+    authEvents.emit('roleChange', null); // FIX GAP-4: notify _layout.tsx
     return true;
   } catch {
     return false;
