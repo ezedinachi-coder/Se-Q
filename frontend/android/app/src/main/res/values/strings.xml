@@ -24,5 +24,5 @@
     to write it here at build time, OR simply paste it once and keep this
     file out of public repositories.
   -->
-  <string name="google_maps_api_key" translatable="false">PASTE_YOUR_GOOGLE_MAPS_API_KEY_HERE</string>
+  <string name="google_maps_api_key" translatable="false">AIzaSyD2GXzAdRJxJzzj24tKqtcBouatKaMy45w</string>
 </resources>
