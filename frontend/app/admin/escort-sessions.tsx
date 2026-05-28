@@ -277,7 +277,7 @@ export default function AdminEscortSessions() {
           <Ionicons name="arrow-back" size={24} color="#fff" />
         </TouchableOpacity>
         <Text style={styles.headerTitle}>
-          {showActiveOnly ? `Escort Sessions (${sessions.length})` : `All Sessions (${sessions.length})`}
+          {showActiveOnly ? `Active Escorts (${sessions.length})` : `Escort History (${sessions.length})`}
         </Text>
         <View style={{ flexDirection: 'row', gap: 10 }}>
           <TouchableOpacity onPress={() => setShowActiveOnly(v => !v)}>
@@ -320,7 +320,7 @@ export default function AdminEscortSessions() {
       {/* Active filter chips */}
       {(showActiveOnly || dateFilter !== 'all') && (
         <View style={styles.filterBar}>
-          {showActiveOnly  && <Text style={styles.filterChip}>🟢 Active Only</Text>}
+          {showActiveOnly  && <Text style={styles.filterChip}>🟢 Active Escorts</Text>}
           {dateFilter !== 'all' && <Text style={styles.filterChip}>📅 {DATE_LABELS[dateFilter]}</Text>}
         </View>
       )}

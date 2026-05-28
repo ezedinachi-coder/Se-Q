@@ -471,7 +471,7 @@ export default function AdminDashboard() {
             { label: 'Security Map',   icon: 'map',              color: '#14B8A6', route: '/admin/security-map' },
             { label: 'Track Users',    icon: 'locate',           color: '#F97316', route: '/admin/track-user' },
             { label: 'Invite Codes',   icon: 'key',              color: '#64748B', route: '/admin/invite-codes' },
-            { label: 'Escort Sessions', icon: 'navigate',        color: '#10B981', route: '/security/escort-sessions' },
+            { label: 'Escort Sessions', icon: 'navigate',        color: '#10B981', route: '/admin/escort-sessions' },
             { label: 'Search & Export', icon: 'search',          color: '#0EA5E9', route: '/admin/search' },
             { label: 'Audit Log',      icon: 'document-text',    color: '#475569', route: '/admin/audit-log' },
           ].map((a: any) => (
