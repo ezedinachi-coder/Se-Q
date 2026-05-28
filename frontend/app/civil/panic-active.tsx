@@ -99,6 +99,21 @@ export default function PanicActive() {
   const [screen, setScreen] = useState<Screen>('category');
   const [emergencyType, setEmergencyType] = useState<'ambulance' | 'fire' | null>(null);
 
+  // FIX GAP-2: Keep a ref to the in-flight ambient capture so we can cancel()
+  // it immediately if the user aborts, a 401 fires, or the component unmounts
+  // before the 30 s recording finishes. Without this, the orphaned _record()
+  // async function ran for up to 35 s after logout and then called
+  // AudioManager.releaseFocus() on the *new* session, overwriting its mode.
+  const captureRef = useRef<ReturnType<typeof beginAmbientCapture> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      // Cancel any in-flight recording when the screen unmounts for any reason.
+      captureRef.current?.cancel();
+      captureRef.current = null;
+    };
+  }, []);
+
   // ── Escape-hatch: only fires when screen is 'activating' ─────────────────
   const screenRef = React.useRef(screen);
   React.useEffect(() => { screenRef.current = screen; }, [screen]);
@@ -138,6 +153,7 @@ export default function PanicActive() {
       setScreen('emergency_contacts');
     } else if (SECURITY_EMERGENCIES.includes(category)) {
       const capture = beginAmbientCapture();
+      captureRef.current = capture;           // FIX GAP-2: store so unmount can cancel
       await activatePanic(category, capture);
     }
   };
@@ -206,6 +222,11 @@ export default function PanicActive() {
       }
     } catch (err: any) {
       if (err?.response?.status === 401) {
+        // FIX GAP-2: cancel the ambient recording before clearing auth so
+        // the orphaned _record() does not call releaseFocus() on the next
+        // session's AudioManager after its 30/35 s timer expires.
+        captureRef.current?.cancel();
+        captureRef.current = null;
         await clearAuthData();
         router.replace('/auth/login');
       } else {
