@@ -25,6 +25,7 @@ import { Audio } from 'expo-av';
 import axios from 'axios';
 import { getAuthToken, clearAuthData } from '../../utils/auth';
 import { LocationMapModal } from '../../components/LocationMapModal';
+import { TrailMapModal } from '../../components/TrailMapModal';
 import BACKEND_URL from '../../utils/config';
 import { AudioManager, AudioPriority } from '../../utils/AudioManager';
 
@@ -57,6 +58,9 @@ export default function SecurityPanics() {
   const [myUserId, setMyUserId] = useState<string | null>(null); // for first-responder lock
   const [locationModal, setLocationModal] = useState<{
     visible: boolean; lat: number; lng: number; title: string
+  } | null>(null);
+  const [trailModal, setTrailModal] = useState<{
+    visible: boolean; points: any[]; title: string; subtitle: string;
   } | null>(null);
   const [respondModal, setRespondModal] = useState<any>(null);
   const [countdown, setCountdown] = useState(10);
@@ -547,6 +551,22 @@ export default function SecurityPanics() {
               <View style={gpsStyles.liveDot} />
               <Text style={gpsStyles.liveText}>LIVE · {countdown}s</Text>
             </View>
+            {history.length > 1 && (
+              <TouchableOpacity
+                style={gpsStyles.trailBtn}
+                onPress={() => {
+                  setTrailModal({
+                    visible: true,
+                    points: [...history].reverse(),
+                    title: `${getSenderName(item)}'s Movement Trail`,
+                    subtitle: `${history.length} GPS points`,
+                  });
+                }}
+              >
+                <Ionicons name="navigate" size={13} color="#3B82F6" />
+                <Text style={gpsStyles.trailBtnText}>Show Trail</Text>
+              </TouchableOpacity>
+            )}
           </View>
 
           {chronoHistory.length === 0 ? (
@@ -777,6 +797,16 @@ export default function SecurityPanics() {
         />
       )}
 
+      {trailModal && (
+        <TrailMapModal
+          visible={trailModal.visible}
+          onClose={() => setTrailModal(null)}
+          points={trailModal.points}
+          title={trailModal.title}
+          subtitle={trailModal.subtitle}
+        />
+      )}
+
       {/* Profile Photo Full-Size Modal */}
       {profilePhotoModal && (
         <Modal visible transparent animationType="slide" onRequestClose={() => setProfilePhotoModal(null)}>
@@ -907,13 +937,15 @@ const styles = StyleSheet.create({
 
 const gpsStyles = StyleSheet.create({
   container:    { marginBottom: 4, backgroundColor: '#0F172A', borderRadius: 12, padding: 12, borderWidth: 1, borderColor: '#F59E0B30' },
-  header:       { flexDirection: 'row', alignItems: 'center', gap: 7, marginBottom: 10 },
+  header:       { flexDirection: 'row', alignItems: 'center', gap: 7, marginBottom: 10, flexWrap: 'wrap' },
   title:        { flex: 1, fontSize: 13, fontWeight: '600', color: '#F59E0B' },
   countBadge:   { backgroundColor: '#F59E0B', paddingHorizontal: 7, paddingVertical: 2, borderRadius: 10 },
   countText:    { fontSize: 11, fontWeight: '700', color: '#fff' },
   liveBadge:    { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: '#10B98120', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 10 },
   liveDot:      { width: 6, height: 6, borderRadius: 3, backgroundColor: '#10B981' },
   liveText:     { fontSize: 10, fontWeight: '700', color: '#10B981' },
+  trailBtn:     { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: '#3B82F620', paddingHorizontal: 10, paddingVertical: 5, borderRadius: 8, borderWidth: 1, borderColor: '#3B82F640' },
+  trailBtnText: { fontSize: 11, fontWeight: '600', color: '#3B82F6' },
   row:          { flexDirection: 'row', alignItems: 'flex-start', paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#1E293B40', paddingHorizontal: 4 },
   rowLatest:    { backgroundColor: '#3B82F608', borderRadius: 8, paddingHorizontal: 8 },
   trail:        { width: 20, alignItems: 'center', marginRight: 10, paddingTop: 2 },
