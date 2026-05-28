@@ -1,21 +1,25 @@
 /**
  * components/TrailMapModal.tsx
  *
- * Full-screen trail map — Google Maps JS API via WebView.
+ * Full-screen trail map using react-native-maps + Google Maps provider.
+ * Renders a GPS movement trail as a polyline with direction arrows,
+ * start/end markers, auto-fit bounds, and full native gesture support
+ * (rotate, tilt, pinch-zoom).
  *
- * Shows GPS movement trail as a polyline with animated direction arrows,
- * start/end markers, and full Google Maps controls (zoom, Street View, rotate).
- * Supports satellite, hybrid, roadmap, terrain via a custom type bar.
+ * Prop interface is identical to the previous Mapbox version.
+ * All callers (admin/panics, admin/escort-sessions, security/escort-sessions)
+ * require zero changes.
  */
 
-import React, { useState, useCallback } from 'react';
+import React, { useState, useRef, useCallback, useEffect } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, Platform,
   Modal, ActivityIndicator, Linking,
 } from 'react-native';
-import { WebView } from 'react-native-webview';
+import MapView, {
+  Marker, Polyline, PROVIDER_GOOGLE,
+} from 'react-native-maps';
 import { Ionicons } from '@expo/vector-icons';
-import Constants from 'expo-constants';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -34,10 +38,14 @@ interface TrailMapModalProps {
   subtitle?: string;
 }
 
-// ── Bounding box / center ─────────────────────────────────────────────────────
+// ── Bounding region ───────────────────────────────────────────────────────────
 
-function computeBounds(points: GpsPoint[]) {
-  if (!points.length) return { lat: 9.082, lng: 8.6753, zoom: 7 }; // Nigeria center
+function computeRegion(points: GpsPoint[]) {
+  if (!points.length) {
+    // Default to Nigeria center
+    return { latitude: 9.082, longitude: 8.6753, latitudeDelta: 5, longitudeDelta: 5 };
+  }
+
   let minLat = 90, maxLat = -90, minLng = 180, maxLng = -180;
   for (const p of points) {
     if (p.latitude  < minLat) minLat = p.latitude;
@@ -45,173 +53,64 @@ function computeBounds(points: GpsPoint[]) {
     if (p.longitude < minLng) minLng = p.longitude;
     if (p.longitude > maxLng) maxLng = p.longitude;
   }
-  const lat     = (minLat + maxLat) / 2;
-  const lng     = (minLng + maxLng) / 2;
-  const latSpan = maxLat - minLat || 0.01;
-  const zoom    = Math.max(8, Math.min(17, Math.floor(Math.log2(170 / latSpan))));
-  return { lat, lng, zoom, minLat, maxLat, minLng, maxLng };
+
+  const latPad = Math.max((maxLat - minLat) * 0.25, 0.005);
+  const lngPad = Math.max((maxLng - minLng) * 0.25, 0.005);
+
+  return {
+    latitude:      (minLat + maxLat) / 2,
+    longitude:     (minLng + maxLng) / 2,
+    latitudeDelta:  (maxLat - minLat) + latPad * 2,
+    longitudeDelta: (maxLng - minLng) + lngPad * 2,
+  };
 }
 
-// ── Trail HTML builder ────────────────────────────────────────────────────────
+// ── Direction arrows ──────────────────────────────────────────────────────────
+// Placed at evenly-spaced intervals along the trail.
 
-function buildTrailHTML(apiKey: string, points: GpsPoint[], initialMapType = 'hybrid'): string {
-  const { lat, lng, zoom, minLat, maxLat, minLng, maxLng } = computeBounds(points);
-  const coordsJson   = JSON.stringify(points.map(p => ({ lat: p.latitude, lng: p.longitude })));
-  const firstTs      = points[0]?.timestamp  ? new Date(points[0].timestamp).toLocaleString()  : '';
-  const lastTs       = points[points.length - 1]?.timestamp
-    ? new Date(points[points.length - 1].timestamp).toLocaleString() : '';
+function ArrowMarker({
+  from,
+  to,
+}: {
+  from: GpsPoint;
+  to: GpsPoint;
+}) {
+  // Bearing in degrees
+  const dLng = (to.longitude - from.longitude) * (Math.PI / 180);
+  const lat1 = from.latitude * (Math.PI / 180);
+  const lat2 = to.latitude   * (Math.PI / 180);
+  const y = Math.sin(dLng) * Math.cos(lat2);
+  const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLng);
+  const bearing = (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
 
-  return `<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
-<style>
-  * { margin:0; padding:0; box-sizing:border-box; }
-  html, body, #map { width:100%; height:100%; background:#0F172A; }
-  .type-bar {
-    position:absolute; top:10px; left:50%; transform:translateX(-50%);
-    z-index:9999; display:flex; gap:5px;
-    background:rgba(15,23,42,0.92); border:1px solid #334155;
-    border-radius:24px; padding:5px 8px;
-  }
-  .type-btn {
-    font-family:-apple-system,sans-serif; font-size:11px; font-weight:700;
-    color:#64748B; background:transparent; border:none; border-radius:18px;
-    padding:5px 10px; cursor:pointer; white-space:nowrap;
-  }
-  .type-btn.active { background:#2563EB; color:#fff; }
-  .gm-style-mtc { display:none!important; }
-  .info-chip {
-    position:absolute; bottom:10px; left:10px; z-index:9999;
-    background:rgba(15,23,42,0.88); border:1px solid #1E293B;
-    border-radius:10px; padding:8px 12px;
-    font-family:-apple-system,sans-serif; font-size:11px; color:#94A3B8;
-    pointer-events:none;
-    max-width: 200px;
-  }
-  .info-chip b { color:#F1F5F9; display:block; margin-bottom:2px; }
-</style>
-</head>
-<body>
-<div id="map"></div>
+  // Midpoint
+  const midLat = (from.latitude  + to.latitude)  / 2;
+  const midLng = (from.longitude + to.longitude) / 2;
 
-<div class="type-bar" id="typeBar">
-  <button class="type-btn ${initialMapType==='hybrid'?'active':''}"    onclick="setType('hybrid',this)">🛰 Hybrid</button>
-  <button class="type-btn ${initialMapType==='satellite'?'active':''}" onclick="setType('satellite',this)">📡 Sat</button>
-  <button class="type-btn ${initialMapType==='roadmap'?'active':''}"   onclick="setType('roadmap',this)">🗺 Roads</button>
-</div>
-
-<div class="info-chip" id="infoChip">
-  <b>${points.length} GPS points</b>
-  ${firstTs ? 'From: ' + firstTs : ''}
-  ${lastTs  ? '<br>To: '   + lastTs  : ''}
-</div>
-
-<script>
-var map;
-var pts = ${coordsJson};
-
-function initMap() {
-  map = new google.maps.Map(document.getElementById('map'), {
-    center: { lat: ${lat}, lng: ${lng} },
-    zoom: ${zoom},
-    mapTypeId: '${initialMapType}',
-    disableDefaultUI: false,
-    mapTypeControl: false,
-    streetViewControl: true,
-    fullscreenControl: false,
-    rotateControl: true,
-    gestureHandling: 'greedy',
-  });
-
-  if (pts.length < 2) { return; }
-
-  // ── Trail polyline ──────────────────────────────────────────────────────────
-  var polyline = new google.maps.Polyline({
-    path: pts,
-    geodesic: true,
-    strokeColor: '#3B82F6',
-    strokeOpacity: 0.9,
-    strokeWeight: 4,
-    icons: [{
-      icon: {
-        path: google.maps.SymbolPath.FORWARD_CLOSED_ARROW,
-        scale: 3,
-        strokeColor: '#3B82F6',
-        strokeWeight: 2,
-        fillColor: '#fff',
-        fillOpacity: 0.9,
-      },
-      offset: '50%',
-      repeat: '100px',
-    }],
-    map: map,
-  });
-
-  // ── Start marker ────────────────────────────────────────────────────────────
-  new google.maps.Marker({
-    position: pts[0],
-    map: map,
-    title: 'Start' + (${JSON.stringify(firstTs)} ? ' — ' + ${JSON.stringify(firstTs)} : ''),
-    icon: {
-      path: google.maps.SymbolPath.CIRCLE,
-      scale: 10,
-      fillColor: '#22C55E',
-      fillOpacity: 1,
-      strokeColor: '#fff',
-      strokeWeight: 2.5,
-    },
-    label: { text: 'S', color: '#fff', fontWeight: '700', fontSize: '11px' },
-    zIndex: 10,
-  });
-
-  // ── End marker ──────────────────────────────────────────────────────────────
-  new google.maps.Marker({
-    position: pts[pts.length - 1],
-    map: map,
-    title: 'End' + (${JSON.stringify(lastTs)} ? ' — ' + ${JSON.stringify(lastTs)} : ''),
-    icon: {
-      path: 'M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z',
-      fillColor: '#EF4444',
-      fillOpacity: 1,
-      strokeColor: '#fff',
-      strokeWeight: 1.5,
-      scale: 1.8,
-      anchor: new google.maps.Point(12, 22),
-    },
-    zIndex: 10,
-  });
-
-  // ── Fit bounds to trail ─────────────────────────────────────────────────────
-  try {
-    var bounds = new google.maps.LatLngBounds(
-      { lat: ${minLat ?? lat} - 0.002, lng: ${minLng ?? lng} - 0.002 },
-      { lat: ${maxLat ?? lat} + 0.002, lng: ${maxLng ?? lng} + 0.002 }
-    );
-    map.fitBounds(bounds, { top: 60, bottom: 40, left: 20, right: 20 });
-  } catch(e) {}
+  return (
+    <Marker
+      coordinate={{ latitude: midLat, longitude: midLng }}
+      anchor={{ x: 0.5, y: 0.5 }}
+      flat
+      tracksViewChanges={false}
+    >
+      <View style={[arrow.wrap, { transform: [{ rotate: `${bearing}deg` }] }]}>
+        <View style={arrow.triangle} />
+      </View>
+    </Marker>
+  );
 }
 
-function setType(type, btn) {
-  if (!map) return;
-  map.setMapTypeId(type);
-  document.querySelectorAll('.type-btn').forEach(function(b) { b.classList.remove('active'); });
-  btn.classList.add('active');
-}
-
-window.addEventListener('message', function(e) {
-  try {
-    var msg = JSON.parse(e.data);
-    if (msg.type === 'flyTo' && map) map.panTo({ lat: msg.lat, lng: msg.lng });
-  } catch(e) {}
+const arrow = StyleSheet.create({
+  wrap:     { width: 16, height: 16, justifyContent: 'center', alignItems: 'center' },
+  triangle: {
+    width: 0, height: 0,
+    borderLeftWidth: 5, borderRightWidth: 5, borderBottomWidth: 10,
+    borderLeftColor: 'transparent', borderRightColor: 'transparent',
+    borderBottomColor: '#3B82F6',
+    opacity: 0.9,
+  },
 });
-</script>
-
-<script src="https://maps.googleapis.com/maps/api/js?key=${apiKey}&callback=initMap&libraries=maps,marker" async defer></script>
-</body>
-</html>`;
-}
 
 // ── Coordinate fallback list ──────────────────────────────────────────────────
 
@@ -225,10 +124,13 @@ function TrailFallback({ points }: { points: GpsPoint[] }) {
           key={i}
           style={fb.row}
           onPress={() =>
-            Linking.openURL(`https://www.google.com/maps?q=${pt.latitude},${pt.longitude}`)
+            Linking.openURL(
+              `https://www.google.com/maps?q=${pt.latitude},${pt.longitude}`,
+            )
           }
         >
-          <View style={[fb.dot,
+          <View style={[
+            fb.dot,
             i === 0 && fb.dotStart,
             i === points.length - 1 && fb.dotEnd,
           ]} />
@@ -252,11 +154,18 @@ function TrailFallback({ points }: { points: GpsPoint[] }) {
 const fb = StyleSheet.create({
   wrap:     { flex: 1, padding: 20, alignItems: 'center', backgroundColor: '#0F172A' },
   title:    { color: '#94A3B8', fontSize: 15, fontWeight: '600', marginTop: 12, marginBottom: 16 },
-  row:      { flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 8, width: '100%', borderBottomWidth: 1, borderBottomColor: '#1E293B' },
+  row:      {
+    flexDirection: 'row', alignItems: 'center', gap: 8,
+    paddingVertical: 8, width: '100%',
+    borderBottomWidth: 1, borderBottomColor: '#1E293B',
+  },
   dot:      { width: 10, height: 10, borderRadius: 5, backgroundColor: '#3B82F6' },
   dotStart: { backgroundColor: '#22C55E' },
   dotEnd:   { backgroundColor: '#EF4444' },
-  coord:    { flex: 1, color: '#94A3B8', fontSize: 12, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
+  coord:    {
+    flex: 1, color: '#94A3B8', fontSize: 12,
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+  },
   time:     { color: '#475569', fontSize: 11 },
   more:     { color: '#475569', fontSize: 12, marginTop: 12 },
 });
@@ -270,24 +179,58 @@ export function TrailMapModal({
   title,
   subtitle,
 }: TrailMapModalProps) {
+  const mapRef = useRef<MapView>(null);
+  const [mapReady, setMapReady] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
-  const apiKey: string =
-    (Constants.expoConfig?.extra?.googleMapsApiKey as string) ?? '';
+
+  // Derive stable region and coordinate arrays once
+  const region      = computeRegion(points);
+  const coordinates = points.map((p) => ({
+    latitude:  p.latitude,
+    longitude: p.longitude,
+  }));
+
+  // Fit map to trail once it's ready
+  useEffect(() => {
+    if (!mapReady || coordinates.length < 2 || !mapRef.current) return;
+    const timer = setTimeout(() => {
+      try {
+        mapRef.current?.fitToCoordinates(coordinates, {
+          edgePadding: { top: 60, right: 30, bottom: 60, left: 30 },
+          animated: true,
+        });
+      } catch (_) {}
+    }, 350);
+    return () => clearTimeout(timer);
+  }, [mapReady]);
+
+  const handleMapReady = useCallback(() => {
+    setMapReady(true);
+    setIsLoading(false);
+  }, []);
 
   const openExternal = useCallback(() => {
     if (!points.length) return;
     const { latitude, longitude } = points[0];
-    const url = Platform.OS === 'ios'
-      ? `maps:?q=${encodeURIComponent(title || 'Trail')}&ll=${latitude},${longitude}`
-      : `geo:${latitude},${longitude}?q=${latitude},${longitude}(${encodeURIComponent(title || 'Trail')})`;
+    const url =
+      Platform.OS === 'ios'
+        ? `maps:?q=${encodeURIComponent(title || 'Trail')}&ll=${latitude},${longitude}`
+        : `geo:${latitude},${longitude}?q=${latitude},${longitude}(${encodeURIComponent(title || 'Trail')})`;
     Linking.openURL(url).catch(() =>
-      Linking.openURL(`https://www.google.com/maps?q=${latitude},${longitude}`)
+      Linking.openURL(
+        `https://www.google.com/maps?q=${latitude},${longitude}`,
+      ),
     );
   }, [points, title]);
 
-  const html = apiKey && points.length >= 2
-    ? buildTrailHTML(apiKey, points)
-    : null;
+  // Evenly-spaced arrow indices (max 12 arrows regardless of trail length)
+  const arrowIndices: number[] = [];
+  if (points.length >= 2) {
+    const step = Math.max(1, Math.floor(points.length / Math.min(12, points.length)));
+    for (let i = step; i < points.length; i += step) {
+      arrowIndices.push(i);
+    }
+  }
 
   return (
     <Modal
@@ -297,7 +240,8 @@ export function TrailMapModal({
       onRequestClose={onClose}
     >
       <View style={st.container}>
-        {/* Header */}
+
+        {/* ── Header ── */}
         <View style={st.header}>
           <TouchableOpacity onPress={onClose} style={st.headerBtn}>
             <Ionicons name="close" size={26} color="#fff" />
@@ -313,44 +257,109 @@ export function TrailMapModal({
           </TouchableOpacity>
         </View>
 
-        {/* Map */}
+        {/* ── Legend ── */}
+        <View style={st.legend}>
+          <View style={st.legendItem}>
+            <View style={[st.legendDot, { backgroundColor: '#22C55E' }]} />
+            <Text style={st.legendText}>Start</Text>
+          </View>
+          <View style={st.legendItem}>
+            <View style={st.legendLine} />
+            <Text style={st.legendText}>Trail</Text>
+          </View>
+          <View style={st.legendItem}>
+            <View style={[st.legendDot, { backgroundColor: '#EF4444' }]} />
+            <Text style={st.legendText}>End</Text>
+          </View>
+          <Text style={st.legendCount}>{points.length} pts</Text>
+        </View>
+
+        {/* ── Map ── */}
         <View style={st.mapWrap}>
-          {html ? (
-            <>
-              {isLoading && (
-                <View style={st.loadingOverlay}>
-                  <ActivityIndicator size="large" color="#3B82F6" />
-                  <Text style={st.loadingText}>Loading Google Maps…</Text>
-                </View>
-              )}
-              <WebView
-                source={{ html }}
-                style={st.webview}
-                originWhitelist={['*']}
-                javaScriptEnabled
-                domStorageEnabled
-                scrollEnabled={false}
-                bounces={false}
-                mixedContentMode="always"
-                userAgent="Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-                onLoadEnd={() => setIsLoading(false)}
-                onError={() => setIsLoading(false)}
-              />
-            </>
-          ) : !apiKey ? (
-            <View style={st.noKey}>
-              <Ionicons name="key-outline" size={42} color="#EF4444" />
-              <Text style={st.noKeyTitle}>Google Maps API Key Missing</Text>
-              <Text style={st.noKeyText}>
-                Add your key to app.config.js → extra.googleMapsApiKey
-              </Text>
+          {/* Loading overlay */}
+          {isLoading && (
+            <View style={st.loadingOverlay}>
+              <ActivityIndicator size="large" color="#3B82F6" />
+              <Text style={st.loadingText}>Loading map…</Text>
             </View>
+          )}
+
+          {points.length >= 2 && Platform.OS !== 'web' ? (
+            <MapView
+              ref={mapRef}
+              style={StyleSheet.absoluteFillObject}
+              provider={PROVIDER_GOOGLE}
+              mapType="hybrid"
+              initialRegion={region}
+              rotateEnabled
+              pitchEnabled
+              zoomEnabled
+              scrollEnabled
+              showsCompass
+              onMapReady={handleMapReady}
+            >
+              {/* Trail polyline */}
+              <Polyline
+                coordinates={coordinates}
+                strokeColor="#3B82F6"
+                strokeWidth={4}
+                lineDashPattern={[12, 6]}
+                geodesic
+              />
+
+              {/* Direction arrows */}
+              {arrowIndices.map((i) => (
+                <ArrowMarker
+                  key={`arrow-${i}`}
+                  from={points[i - 1]}
+                  to={points[i]}
+                />
+              ))}
+
+              {/* Start marker */}
+              <Marker
+                coordinate={{
+                  latitude:  points[0].latitude,
+                  longitude: points[0].longitude,
+                }}
+                title="Start"
+                description={
+                  points[0].timestamp
+                    ? new Date(points[0].timestamp).toLocaleString()
+                    : undefined
+                }
+                tracksViewChanges={false}
+              >
+                <View style={mk.start}>
+                  <Ionicons name="flag" size={16} color="#fff" />
+                </View>
+              </Marker>
+
+              {/* End marker */}
+              <Marker
+                coordinate={{
+                  latitude:  points[points.length - 1].latitude,
+                  longitude: points[points.length - 1].longitude,
+                }}
+                title="End"
+                description={
+                  points[points.length - 1].timestamp
+                    ? new Date(points[points.length - 1].timestamp).toLocaleString()
+                    : undefined
+                }
+                tracksViewChanges={false}
+              >
+                <View style={mk.end}>
+                  <Ionicons name="location" size={16} color="#fff" />
+                </View>
+              </Marker>
+            </MapView>
           ) : (
             <TrailFallback points={points} />
           )}
         </View>
 
-        {/* Stats */}
+        {/* ── Stats bar ── */}
         {points.length >= 2 && (
           <View style={st.statsBar}>
             <View style={st.statItem}>
@@ -376,38 +385,72 @@ export function TrailMapModal({
   );
 }
 
+// ── Styles ────────────────────────────────────────────────────────────────────
+
 const st = StyleSheet.create({
-  container:    { flex: 1, backgroundColor: '#0F172A' },
-  header:       {
+  container:      { flex: 1, backgroundColor: '#0F172A' },
+  header: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
     paddingHorizontal: 12,
     paddingTop: Platform.OS === 'ios' ? 50 : 16,
     paddingBottom: 14,
     backgroundColor: '#1E293B',
+    borderBottomWidth: 1, borderBottomColor: '#334155',
   },
-  headerBtn:    { width: 44, height: 44, justifyContent: 'center', alignItems: 'center' },
-  headerInfo:   { flex: 1, alignItems: 'center' },
-  headerTitle:  { fontSize: 17, fontWeight: '700', color: '#fff' },
-  headerSub:    { fontSize: 12, color: '#64748B', marginTop: 2 },
-  mapWrap:      { flex: 1, position: 'relative' },
-  webview:      { flex: 1, backgroundColor: '#0F172A' },
+  headerBtn:      { width: 44, height: 44, justifyContent: 'center', alignItems: 'center' },
+  headerInfo:     { flex: 1, alignItems: 'center' },
+  headerTitle:    { fontSize: 17, fontWeight: '700', color: '#fff' },
+  headerSub:      { fontSize: 12, color: '#64748B', marginTop: 2 },
+  legend: {
+    flexDirection: 'row', alignItems: 'center', gap: 14,
+    paddingHorizontal: 16, paddingVertical: 8,
+    backgroundColor: '#1E293B',
+    borderBottomWidth: 1, borderBottomColor: '#334155',
+  },
+  legendItem:     { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  legendDot:      { width: 10, height: 10, borderRadius: 5 },
+  legendLine:     { width: 20, height: 3, backgroundColor: '#3B82F6', borderRadius: 2 },
+  legendText:     { color: '#94A3B8', fontSize: 12 },
+  legendCount:    { color: '#3B82F6', fontSize: 12, fontWeight: '700', marginLeft: 'auto' },
+  mapWrap:        { flex: 1, position: 'relative' },
   loadingOverlay: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: '#0F172A',
     justifyContent: 'center', alignItems: 'center', zIndex: 10,
   },
-  loadingText:  { color: '#94A3B8', marginTop: 12, fontSize: 13 },
-  statsBar:     {
-    flexDirection: 'row', backgroundColor: '#1E293B', padding: 14, gap: 12,
+  loadingText:    { color: '#94A3B8', marginTop: 12, fontSize: 13 },
+  statsBar: {
+    flexDirection: 'row',
+    backgroundColor: '#1E293B',
+    padding: 14,
     paddingBottom: Platform.OS === 'ios' ? 32 : 14,
+    gap: 12,
   },
-  statItem:     { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 6 },
-  statLabel:    { color: '#64748B', fontSize: 11, fontWeight: '600' },
-  statValue:    { color: '#94A3B8', fontSize: 11, flex: 1 },
-  statDivider:  { width: 1, backgroundColor: '#334155' },
-  noKey:        { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 32, backgroundColor: '#0F172A' },
-  noKeyTitle:   { color: '#EF4444', fontSize: 16, fontWeight: '700', marginTop: 14, marginBottom: 8 },
-  noKeyText:    { color: '#64748B', fontSize: 13, textAlign: 'center', lineHeight: 20 },
+  statItem:       { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 6 },
+  statLabel:      { color: '#64748B', fontSize: 11, fontWeight: '600' },
+  statValue:      { color: '#94A3B8', fontSize: 11, flex: 1 },
+  statDivider:    { width: 1, backgroundColor: '#334155' },
+});
+
+// ── Marker styles ─────────────────────────────────────────────────────────────
+
+const mk = StyleSheet.create({
+  start: {
+    width: 30, height: 30, borderRadius: 15,
+    backgroundColor: '#22C55E',
+    justifyContent: 'center', alignItems: 'center',
+    borderWidth: 2.5, borderColor: '#fff',
+    shadowColor: '#000', shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.4, shadowRadius: 4, elevation: 6,
+  },
+  end: {
+    width: 30, height: 30, borderRadius: 15,
+    backgroundColor: '#EF4444',
+    justifyContent: 'center', alignItems: 'center',
+    borderWidth: 2.5, borderColor: '#fff',
+    shadowColor: '#000', shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.4, shadowRadius: 4, elevation: 6,
+  },
 });
 
 export default TrailMapModal;

@@ -1,35 +1,39 @@
 /**
  * components/NativeMap.tsx
  *
- * Google Maps JavaScript API — rendered inside react-native-webview.
+ * Native map using react-native-maps with Google Maps provider.
  *
- * WHY GOOGLE MAPS:
- *   Every alternative (Esri/Maxar, Sentinel-2, Mapbox) has stale imagery for
- *   Nigeria/Africa (1-6 years old). Google Maps has current satellite imagery,
- *   interactive Street View with rotation, and a generous free tier:
- *   10,000 map loads/month at no cost (Essentials SKU, March 2025 pricing).
+ * WHY react-native-maps:
+ *   - Full native gesture support: two-finger rotate, tilt, pinch zoom — all work
+ *   - Uses Google Maps tile servers → current imagery for Nigeria/Africa
+ *   - No Mapbox complexity, no separate downloads token
+ *   - Autolinking handles native setup; no --clean prebuild needed
  *
- * SETUP — one-time (5 minutes):
- *   1. console.cloud.google.com → New project → Enable "Maps JavaScript API"
- *   2. APIs & Services → Credentials → Create API Key
- *   3. Restrict key: Application restrictions → Android apps (com.seq.app)
- *      + HTTP referrers for web. Also restrict to Maps JavaScript API only.
- *   4. Add to app.config.js  →  extra.googleMapsApiKey: process.env.GOOGLE_MAPS_API_KEY
- *   5. Add to eas.json env   →  GOOGLE_MAPS_API_KEY: "AIza..."
+ * SETUP (one-time, do not run prebuild --clean):
+ *   1. yarn add react-native-maps
+ *   2. Add ONE line to android/app/src/main/res/values/strings.xml:
+ *        <string name="google_maps_api_key">YOUR_AIza_KEY_HERE</string>
+ *   3. Add ONE meta-data entry to android/app/src/main/AndroidManifest.xml
+ *      inside the <application> tag:
+ *        <meta-data
+ *            android:name="com.google.android.geo.API_KEY"
+ *            android:value="@string/google_maps_api_key"/>
+ *   4. EAS build (no prebuild needed — autolinking runs on the build server).
  *
- * MAP TYPES available:
- *   'satellite' → pure satellite (current Google Earth imagery)
- *   'hybrid'    → satellite + road/label overlay  ← RECOMMENDED default
- *   'roadmap'   → full Google Maps road view (replaces OpenStreetMap)
- *   'terrain'   → topographic view
- *
- * All RN ↔ WebView communication uses postMessage / onMessage JSON.
+ * PROP INTERFACE: identical to the previous Mapbox version — all screens
+ * (set-location, nearby, security-map, etc.) require zero changes.
  */
 
-import React, { useRef, useEffect, useCallback } from 'react';
-import { View, StyleSheet, Platform } from 'react-native';
-import { WebView } from 'react-native-webview';
-import Constants from 'expo-constants';
+import React, { useRef, useEffect, useState, useCallback } from 'react';
+import {
+  View, Text, StyleSheet, Platform, TouchableOpacity,
+  ActivityIndicator, Linking,
+} from 'react-native';
+import MapView, {
+  Marker, Circle, PROVIDER_GOOGLE,
+  MapType, Region,
+} from 'react-native-maps';
+import { Ionicons } from '@expo/vector-icons';
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -39,7 +43,7 @@ export interface MarkerData {
   longitude: number;
   title?: string;
   description?: string;
-  pinColor?: string; // hex e.g. '#EF4444'
+  pinColor?: string;
 }
 
 export type GoogleMapType = 'satellite' | 'hybrid' | 'roadmap' | 'terrain';
@@ -57,250 +61,96 @@ export interface NativeMapProps {
   onPress?: (coords: { latitude: number; longitude: number }) => void;
   onMarkerChange?: (coords: { latitude: number; longitude: number }) => void;
   style?: any;
-  /** Default: 'hybrid' — satellite imagery with road/label overlay */
+  /** Default: 'hybrid' — satellite with road/label overlay */
   initialMapStyle?: GoogleMapType;
 }
 
-// ── Zoom from latitudeDelta ───────────────────────────────────────────────────
+// ── Map type → react-native-maps MapType ─────────────────────────────────────
 
-function deltaToZoom(latitudeDelta: number): number {
-  return Math.max(3, Math.min(20, Math.round(Math.log2(180 / latitudeDelta))));
+function toRNMapType(style: GoogleMapType): MapType {
+  switch (style) {
+    case 'satellite': return 'satellite';
+    case 'hybrid':    return 'hybrid';
+    case 'terrain':   return 'terrain';
+    case 'roadmap':
+    default:          return 'standard';
+  }
 }
 
-// ── Hex color → Google Maps marker icon URL ───────────────────────────────────
+// ── Type toggle bar ───────────────────────────────────────────────────────────
 
-function hexToGoogleColor(hex?: string): string {
-  // Google Maps marker colors from the Chart API replacement
-  const colorMap: Record<string, string> = {
-    '#EF4444': 'red', '#22C55E': 'green', '#3B82F6': 'blue',
-    '#F59E0B': 'yellow', '#8B5CF6': 'purple', '#F97316': 'orange',
-  };
-  return colorMap[hex?.toUpperCase() ?? ''] ?? 'red';
+const MAP_TYPES: { key: GoogleMapType; label: string; icon: string }[] = [
+  { key: 'hybrid',    label: 'Hybrid',     icon: '🛰' },
+  { key: 'satellite', label: 'Satellite',  icon: '📡' },
+  { key: 'standard' as any,  label: 'Roads',  icon: '🗺' },
+  { key: 'terrain',   label: 'Terrain',    icon: '🏔' },
+];
+
+function TypeBar({
+  current,
+  onChange,
+}: {
+  current: GoogleMapType;
+  onChange: (t: GoogleMapType) => void;
+}) {
+  return (
+    <View style={bar.wrap}>
+      {MAP_TYPES.map((t) => {
+        const active = current === t.key || (current === 'roadmap' && t.key === ('standard' as any));
+        return (
+          <TouchableOpacity
+            key={t.key}
+            style={[bar.btn, active && bar.btnActive]}
+            onPress={() => onChange(t.key)}
+            activeOpacity={0.75}
+          >
+            <Text style={[bar.label, active && bar.labelActive]}>
+              {t.icon} {t.label}
+            </Text>
+          </TouchableOpacity>
+        );
+      })}
+    </View>
+  );
 }
 
-// ── HTML builder ──────────────────────────────────────────────────────────────
-
-function buildGoogleMapsHTML(opts: {
-  apiKey: string;
-  lat: number;
-  lng: number;
-  zoom: number;
-  markers: MarkerData[];
-  radiusMeters: number;
-  initialMapType: GoogleMapType;
-}): string {
-  const { apiKey, lat, lng, zoom, markers, radiusMeters, initialMapType } = opts;
-  const markersJson = JSON.stringify(markers);
-
-  return `<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
-<style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  html, body, #map { width: 100%; height: 100%; background: #0F172A; }
-
-  /* Custom map type toggle */
-  .map-type-bar {
-    position: absolute;
-    top: 10px;
-    left: 50%;
-    transform: translateX(-50%);
-    z-index: 9999;
-    display: flex;
-    gap: 6px;
-    background: rgba(15,23,42,0.92);
-    border: 1px solid #334155;
-    border-radius: 24px;
-    padding: 5px 8px;
-    pointer-events: all;
-  }
-  .map-type-btn {
-    font-family: -apple-system, sans-serif;
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 0.3px;
-    color: #64748B;
-    background: transparent;
-    border: none;
-    border-radius: 18px;
-    padding: 5px 11px;
-    cursor: pointer;
-    transition: background 0.15s, color 0.15s;
-    white-space: nowrap;
-  }
-  .map-type-btn.active {
-    background: #2563EB;
-    color: #fff;
-  }
-
-  /* Hide Google's default map type control (we use our own) */
-  .gm-style-mtc { display: none !important; }
-
-  /* Style Google Maps UI to match dark theme */
-  .gm-control-active, .gm-svpc, .gm-fullscreen-control {
-    background-color: rgba(15,23,42,0.92) !important;
-    border-radius: 8px !important;
-  }
-  .gm-bundled-control .gmnoprint {
-    background: rgba(15,23,42,0.92) !important;
-  }
-</style>
-</head>
-<body>
-<div id="map"></div>
-
-<!-- Custom type bar -->
-<div class="map-type-bar" id="typeBar">
-  <button class="map-type-btn ${initialMapType === 'hybrid'   ? 'active' : ''}" onclick="setType('hybrid')">🛰 Hybrid</button>
-  <button class="map-type-btn ${initialMapType === 'satellite'? 'active' : ''}" onclick="setType('satellite')">📡 Satellite</button>
-  <button class="map-type-btn ${initialMapType === 'roadmap'  ? 'active' : ''}" onclick="setType('roadmap')">🗺 Roads</button>
-  <button class="map-type-btn ${initialMapType === 'terrain'  ? 'active' : ''}" onclick="setType('terrain')">🏔 Terrain</button>
-</div>
-
-<script>
-var map, currentMarkers = [], radiusCircle = null;
-
-function initMap() {
-  map = new google.maps.Map(document.getElementById('map'), {
-    center: { lat: ${lat}, lng: ${lng} },
-    zoom: ${zoom},
-    mapTypeId: '${initialMapType}',
-    disableDefaultUI: false,
-    mapTypeControl: false,       // we use our own bar
-    streetViewControl: true,     // pegman for Street View
-    fullscreenControl: false,
-    rotateControl: true,
-    tiltControl: true,
-    gestureHandling: 'greedy',   // single-finger pan (better for mobile)
-    styles: [],                  // no custom style - use Google's standard
-  });
-
-  // ── Markers ───────────────────────────────────────────────────────────────
-  var markersData = ${markersJson};
-  addMarkers(markersData);
-
-  // ── Radius circle ─────────────────────────────────────────────────────────
-  if (${radiusMeters} > 0 && markersData.length > 0) {
-    radiusCircle = new google.maps.Circle({
-      strokeColor: '#3B82F6',
-      strokeOpacity: 0.9,
-      strokeWeight: 2,
-      fillColor: '#3B82F6',
-      fillOpacity: 0.12,
-      map: map,
-      center: { lat: ${lat}, lng: ${lng} },
-      radius: ${radiusMeters},
-    });
-  }
-
-  // ── Map click ─────────────────────────────────────────────────────────────
-  map.addListener('click', function(e) {
-    sendMessage({
-      type: 'mapPress',
-      latitude: e.latLng.lat(),
-      longitude: e.latLng.lng(),
-    });
-  });
-
-  // Signal ready
-  setTimeout(function() { sendMessage({ type: 'mapReady' }); }, 200);
-}
-
-// ── Map type switch ───────────────────────────────────────────────────────────
-function setType(type) {
-  if (!map) return;
-  map.setMapTypeId(type);
-  document.querySelectorAll('.map-type-btn').forEach(function(btn) {
-    btn.classList.remove('active');
-  });
-  event.target.classList.add('active');
-  sendMessage({ type: 'mapTypeChange', mapType: type });
-}
-
-// ── Add markers ───────────────────────────────────────────────────────────────
-function addMarkers(data) {
-  currentMarkers.forEach(function(m) { m.setMap(null); });
-  currentMarkers = [];
-
-  var infoWindow = new google.maps.InfoWindow();
-
-  data.forEach(function(m) {
-    var markerColor = m.pinColor || '#3B82F6';
-    // Use Google's SVG marker path (no external Chart API needed)
-    var svgMarker = {
-      path: 'M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z',
-      fillColor: markerColor,
-      fillOpacity: 1,
-      strokeColor: '#fff',
-      strokeWeight: 1.5,
-      scale: 1.6,
-      anchor: new google.maps.Point(12, 22),
-    };
-
-    var marker = new google.maps.Marker({
-      position: { lat: m.latitude, lng: m.longitude },
-      map: map,
-      icon: svgMarker,
-      title: m.title || '',
-      animation: google.maps.Animation.DROP,
-    });
-
-    if (m.title || m.description) {
-      marker.addListener('click', function() {
-        var content = '<div style="font-family:-apple-system,sans-serif;padding:2px 4px">'
-          + (m.title ? '<b style="font-size:14px;color:#0F172A">' + m.title + '</b>' : '')
-          + (m.description ? '<br><span style="font-size:12px;color:#64748B">' + m.description + '</span>' : '')
-          + '</div>';
-        infoWindow.setContent(content);
-        infoWindow.open(map, marker);
-        sendMessage({ type: 'markerPress', latitude: m.latitude, longitude: m.longitude, id: m.id });
-      });
-    }
-
-    currentMarkers.push(marker);
-  });
-}
-
-// ── postMessage bridge ────────────────────────────────────────────────────────
-function sendMessage(data) {
-  try {
-    if (window.ReactNativeWebView) {
-      window.ReactNativeWebView.postMessage(JSON.stringify(data));
-    } else {
-      window.parent.postMessage(JSON.stringify(data), '*');
-    }
-  } catch(e) {}
-}
-
-// ── Receive commands from RN ──────────────────────────────────────────────────
-window.addEventListener('message', function(e) {
-  try {
-    var msg = JSON.parse(typeof e.data === 'string' ? e.data : JSON.stringify(e.data));
-    if (!map) return;
-    if (msg.type === 'updateMarkers') {
-      addMarkers(msg.markers);
-    } else if (msg.type === 'flyTo') {
-      map.panTo({ lat: msg.lat, lng: msg.lng });
-      if (msg.zoom) map.setZoom(msg.zoom);
-    } else if (msg.type === 'setMapType') {
-      map.setMapTypeId(msg.mapType);
-    }
-  } catch(e) {}
+const bar = StyleSheet.create({
+  wrap: {
+    position: 'absolute', top: 10, left: '50%',
+    transform: [{ translateX: -110 }],
+    zIndex: 10, flexDirection: 'row', gap: 4,
+    backgroundColor: 'rgba(15,23,42,0.92)',
+    borderRadius: 24, paddingHorizontal: 6, paddingVertical: 5,
+    borderWidth: 1, borderColor: '#334155',
+  },
+  btn: {
+    borderRadius: 18, paddingHorizontal: 9, paddingVertical: 5,
+  },
+  btnActive: { backgroundColor: '#2563EB' },
+  label: { fontSize: 11, fontWeight: '700', color: '#64748B' },
+  labelActive: { color: '#fff' },
 });
-</script>
 
-<!-- Load Google Maps JS API last -->
-<script
-  src="https://maps.googleapis.com/maps/api/js?key=${apiKey}&callback=initMap&libraries=maps,marker"
-  async defer>
-</script>
-</body>
-</html>`;
+// ── Coords badge ──────────────────────────────────────────────────────────────
+
+function CoordsBadge({ lat, lng }: { lat: number; lng: number }) {
+  return (
+    <View style={coord.wrap} pointerEvents="none">
+      <Text style={coord.text}>{lat.toFixed(4)}, {lng.toFixed(4)}</Text>
+    </View>
+  );
 }
 
-// ── NativeMap component ───────────────────────────────────────────────────────
+const coord = StyleSheet.create({
+  wrap: {
+    position: 'absolute', bottom: 8, left: 8, zIndex: 10,
+    backgroundColor: 'rgba(15,23,42,0.82)',
+    borderRadius: 6, paddingHorizontal: 8, paddingVertical: 4,
+  },
+  text: { fontSize: 11, color: '#94A3B8' },
+});
+
+// ── NativeMap ─────────────────────────────────────────────────────────────────
 
 export function NativeMap({
   region,
@@ -312,15 +162,14 @@ export function NativeMap({
   style,
   initialMapStyle = 'hybrid',
 }: NativeMapProps) {
-  const webViewRef = useRef<WebView>(null);
-
-  const apiKey: string =
-    (Constants.expoConfig?.extra?.googleMapsApiKey as string) ?? '';
+  const mapRef = useRef<MapView>(null);
+  const [mapType, setMapType] = useState<GoogleMapType>(initialMapStyle);
+  const [ready, setReady] = useState(false);
 
   const lat = markerCoords?.latitude  ?? region.latitude;
   const lng = markerCoords?.longitude ?? region.longitude;
-  const zoom = deltaToZoom(region.latitudeDelta);
 
+  // Build marker list
   const allMarkers: MarkerData[] = markers
     ? markers
     : markerCoords
@@ -335,70 +184,135 @@ export function NativeMap({
 
   const radiusMeters = radiusKm ? radiusKm * 1000 : 0;
 
-  // Send updated markers when they change
+  // Animate to new region when it changes (after map is ready)
   useEffect(() => {
-    webViewRef.current?.postMessage(
-      JSON.stringify({ type: 'updateMarkers', markers: allMarkers })
+    if (!ready || !mapRef.current) return;
+    mapRef.current.animateToRegion(
+      {
+        latitude: region.latitude,
+        longitude: region.longitude,
+        latitudeDelta: region.latitudeDelta,
+        longitudeDelta: region.longitudeDelta,
+      },
+      400,
     );
-  }, [JSON.stringify(markers), JSON.stringify(markerCoords)]);
+  }, [region.latitude, region.longitude, ready]);
 
-  // Re-center when region changes
-  useEffect(() => {
-    webViewRef.current?.postMessage(
-      JSON.stringify({ type: 'flyTo', lat, lng, zoom })
+  const handlePress = useCallback(
+    (e: any) => {
+      const { latitude, longitude } = e.nativeEvent.coordinate;
+      onPress?.({ latitude, longitude });
+      onMarkerChange?.({ latitude, longitude });
+    },
+    [onPress, onMarkerChange],
+  );
+
+  const handleMarkerDragEnd = useCallback(
+    (e: any) => {
+      const { latitude, longitude } = e.nativeEvent.coordinate;
+      onPress?.({ latitude, longitude });
+      onMarkerChange?.({ latitude, longitude });
+    },
+    [onPress, onMarkerChange],
+  );
+
+  // Web fallback — MapView not available on web
+  if (Platform.OS === 'web') {
+    return (
+      <View style={[styles.container, style]}>
+        <View style={styles.webFallback}>
+          <Ionicons name="map-outline" size={48} color="#3B82F6" />
+          <Text style={styles.fallbackCoords}>{lat.toFixed(6)}, {lng.toFixed(6)}</Text>
+          <TouchableOpacity
+            style={styles.openBtn}
+            onPress={() =>
+              Linking.openURL(`https://www.google.com/maps?q=${lat},${lng}`)
+            }
+          >
+            <Ionicons name="open-outline" size={16} color="#fff" />
+            <Text style={styles.openBtnText}>Open in Google Maps</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
     );
-  }, [region.latitude, region.longitude]);
-
-  const handleMessage = useCallback((event: any) => {
-    try {
-      const data = JSON.parse(event.nativeEvent.data);
-      if ((data.type === 'mapPress' || data.type === 'markerPress') && onPress) {
-        onPress({ latitude: data.latitude, longitude: data.longitude });
-        if (onMarkerChange && data.type === 'mapPress') {
-          onMarkerChange({ latitude: data.latitude, longitude: data.longitude });
-        }
-      }
-    } catch (_) {}
-  }, [onPress, onMarkerChange]);
-
-  const html = buildGoogleMapsHTML({
-    apiKey,
-    lat,
-    lng,
-    zoom,
-    markers: allMarkers,
-    radiusMeters,
-    initialMapType: initialMapStyle,
-  });
+  }
 
   return (
     <View style={[styles.container, style]}>
-      <WebView
-        ref={webViewRef}
-        source={{ html }}
-        style={styles.webview}
-        originWhitelist={['*']}
-        javaScriptEnabled
-        domStorageEnabled
-        allowsInlineMediaPlayback
-        scrollEnabled={false}
-        bounces={false}
-        onMessage={handleMessage}
-        mixedContentMode="always"
-        // Required: Google Maps JS API checks the referrer / user-agent.
-        // Setting a web user-agent makes the WebView present as a browser.
-        userAgent="Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-        onError={(e) =>
-          console.warn('[NativeMap] WebView error:', e.nativeEvent.description)
-        }
-      />
+      <MapView
+        ref={mapRef}
+        style={StyleSheet.absoluteFillObject}
+        provider={PROVIDER_GOOGLE}
+        mapType={toRNMapType(mapType)}
+        initialRegion={{
+          latitude: region.latitude,
+          longitude: region.longitude,
+          latitudeDelta: region.latitudeDelta,
+          longitudeDelta: region.longitudeDelta,
+        }}
+        // Gesture controls — all enabled for full native UX
+        rotateEnabled
+        pitchEnabled
+        zoomEnabled
+        scrollEnabled
+        showsCompass
+        showsScale
+        showsMyLocationButton={false}
+        showsBuildings
+        showsTraffic={false}
+        // Tap handler
+        onPress={handlePress}
+        onMapReady={() => setReady(true)}
+      >
+        {/* Markers */}
+        {allMarkers.map((m) => (
+          <Marker
+            key={m.id}
+            coordinate={{ latitude: m.latitude, longitude: m.longitude }}
+            title={m.title}
+            description={m.description}
+            pinColor={m.pinColor ?? '#3B82F6'}
+            draggable={!!onMarkerChange}
+            onDragEnd={handleMarkerDragEnd}
+          />
+        ))}
+
+        {/* Radius circle */}
+        {radiusMeters > 0 && allMarkers.length > 0 && (
+          <Circle
+            center={{ latitude: lat, longitude: lng }}
+            radius={radiusMeters}
+            strokeColor="#3B82F6"
+            strokeWidth={2}
+            fillColor="rgba(59,130,246,0.12)"
+          />
+        )}
+      </MapView>
+
+      {/* Map type toggle */}
+      <TypeBar current={mapType} onChange={setMapType} />
+
+      {/* Coords badge */}
+      <CoordsBadge lat={lat} lng={lng} />
     </View>
   );
 }
 
+// ── Styles ────────────────────────────────────────────────────────────────────
+
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#0F172A' },
-  webview:   { flex: 1, backgroundColor: '#0F172A' },
+  container:    { flex: 1, backgroundColor: '#0F172A' },
+  webFallback:  {
+    flex: 1, justifyContent: 'center', alignItems: 'center',
+    backgroundColor: '#0F172A', gap: 12,
+  },
+  fallbackCoords: { color: '#94A3B8', fontSize: 14, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
+  openBtn:      {
+    flexDirection: 'row', alignItems: 'center', gap: 8,
+    backgroundColor: '#3B82F6', paddingVertical: 10,
+    paddingHorizontal: 20, borderRadius: 8, marginTop: 8,
+  },
+  openBtnText:  { color: '#fff', fontWeight: '600', fontSize: 14 },
 });
 
 export default NativeMap;
