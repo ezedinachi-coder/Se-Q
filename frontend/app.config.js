@@ -32,6 +32,15 @@ module.exports = {
         backgroundColor: '#0F172A',
       },
       package: 'com.seq.app',
+      config: {
+        // Injects the key into the native Google Maps Android SDK at prebuild
+        // time so react-native-maps (PROVIDER_GOOGLE) can render map tiles.
+        // This writes google_maps_api_key into strings.xml automatically —
+        // strings.xml still has the key hardcoded as a fallback for local builds.
+        googleMaps: {
+          apiKey: GOOGLE_MAPS_KEY,
+        },
+      },
       permissions: [
         'ACCESS_FINE_LOCATION',
         'ACCESS_COARSE_LOCATION',
@@ -54,7 +63,5 @@ module.exports = {
       backendUrl: 'https://se-q-production.up.railway.app',
       googleMapsApiKey: GOOGLE_MAPS_KEY,
     },
-    // No plugins needed — Google Maps JS API is loaded in the WebView HTML,
-    // no native Android/iOS SDK to link.
   },
 };
