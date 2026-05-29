@@ -1715,16 +1715,40 @@ async def send_message(body: dict = Body(...), user=Depends(get_current_user)):
 
     conv = await db.chat_conversations.find_one({"_id": ObjectId(conv_id)})
     inc_fields: dict = {}
+    recipients_to_notify = []
     if conv:
         for pid in conv.get("participants", []):
             if pid != uid:
                 inc_fields[f"unread_{pid}"] = 1
+                recipients_to_notify.append(pid)
 
     update: dict = {"$set": {"last_message": content, "last_message_at": now}}
     if inc_fields:
         update["$inc"] = inc_fields  # type: ignore[assignment]
 
     await db.chat_conversations.update_one({"_id": ObjectId(conv_id)}, update)
+
+    # Send push notification to recipient(s) so they get notified even when app is closed
+    for recipient_id in recipients_to_notify:
+        try:
+            recipient = await db.users.find_one({"_id": ObjectId(recipient_id)})
+            if recipient and recipient.get("push_token") and expo_push_service:
+                sender_name = user.get("full_name") or user.get("email", "Someone")
+                await expo_push_service.send_push_notification(
+                    token=recipient["push_token"],
+                    title=f"💬 {sender_name}",
+                    body=content[:100] if len(content) > 100 else content,  # Truncate long messages
+                    data={
+                        "type": "chat_message",
+                        "conversation_id": conv_id,
+                        "from_user_id": uid,
+                        "from_name": sender_name,
+                    }
+                )
+                logger.info(f"[Chat] Push notification sent to {recipient.get('email')} for conv {conv_id}")
+        except Exception as e:
+            logger.error(f"[Chat] Failed to send push notification to {recipient_id}: {e}")
+
     return {"ok": True, "conversation_id": conv_id}
 
 @api_router.post("/chat/mark-read")
@@ -2036,6 +2060,60 @@ async def security_nearby(user=Depends(get_current_user)):
         })
 
     return {"panics": panics, "reports": reports}
+
+@api_router.post("/security/refresh-all-locations")
+async def security_refresh_all_locations(user=Depends(get_current_user)):
+    """
+    Push a location-update request to ALL active security agents.
+
+    When a Security/Admin opens NEARBY SECURITY or SECURITY MAP, this endpoint
+    is called to trigger location refresh for all agents. Each agent's app
+    receives a push notification and updates their location via GPS.
+
+    Returns the count of agents that were notified.
+    """
+    if user.get("role") not in ("security", "admin"):
+        raise HTTPException(status_code=403, detail="Security or admin only")
+
+    logger.info(f"[RefreshLocations] Requested by {user.get('email')} ({user.get('role')})")
+
+    # Find all active security agents with push tokens
+    # Active = has a push_token AND (is_active OR recent location update)
+    active_timeout = datetime.utcnow() - timedelta(minutes=10)
+
+    security_users = await db.users.find({
+        "role": "security",
+        "push_token": {"$exists": True, "$ne": None},
+        "$or": [
+            {"is_active": True},
+            {"location_updated_at": {"$gte": active_timeout}}
+        ]
+    }).to_list(None)
+
+    notified_count = 0
+    for sec_user in security_users:
+        # Don't notify the user who requested the refresh (they'll update naturally)
+        if str(sec_user["_id"]) == str(user["_id"]):
+            continue
+
+        try:
+            if expo_push_service and sec_user.get("push_token"):
+                await expo_push_service.send_push_notification(
+                    token=sec_user["push_token"],
+                    title="📍 Location Update Requested",
+                    body="Your location is being refreshed for nearby security map",
+                    data={"type": "location_refresh", "action": "update_location"}
+                )
+                notified_count += 1
+        except Exception as e:
+            logger.error(f"[RefreshLocations] Failed to notify {sec_user.get('email')}: {e}")
+
+    logger.info(f"[RefreshLocations] Notified {notified_count} security agents")
+    return {
+        "ok": True,
+        "notified_count": notified_count,
+        "message": f"Location refresh requested for {notified_count} security agents"
+    }
 
 @api_router.get("/security/nearby-security")
 async def security_nearby_security(user=Depends(get_current_user)):

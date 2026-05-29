@@ -382,23 +382,48 @@ class ExpoPushService:
     def __init__(self):
         self.push_url = "https://exp.host/--/api/v2/push/send"
         logger.info("Expo Push service initialized")
-    
+
     async def send_push_notification(self, token: str, title: str, body: str, data: dict = None):
-        """Send a push notification via Expo"""
+        """Send a push notification via Expo with proper sound and priority for background/closed app state."""
         import httpx
+
+        # Determine notification priority based on type
+        # Critical notifications (panic, chat) need high priority and default sound
+        notif_type = (data or {}).get("type", "")
+        is_critical = notif_type in ("panic", "chat_message", "message", "emergency")
+
         message = {
             "to": token,
             "title": title,
             "body": body,
             "data": data or {},
-            "sound": "default",
+            "sound": "default",  # Always use default sound for audibility
+            "priority": "high",  # High priority ensures delivery even when app is closed
+            # iOS specific
+            "content-available": 1,  # Allows background fetching
+            # Android specific - these ensure heads-up notification with sound
+            "channelId": "emergency" if is_critical else "default",
+            "ttl": 0,  # Time to live - 0 means deliver immediately
         }
+
+        # Add vibrate pattern for critical notifications on Android
+        if is_critical:
+            message["vibrate"] = [0, 500, 200, 500]
+            message["forceSound"] = True
+
         try:
             async with httpx.AsyncClient() as client:
-                response = await client.post(self.push_url, json=[message])
-                return response.json()
+                response = await client.post(
+                    self.push_url,
+                    json=[message],
+                    headers={"Content-Type": "application/json"},
+                    timeout=30  # 30 second timeout for reliability
+                )
+                result = response.json()
+                logger.info(f"[PushNotification] Sent to {token[:20]}... type={notif_type}, response={result.get('data', [{}])[0].get('status', 'unknown') if 'data' in result else 'ok'}")
+                return result
         except Exception as e:
-            logger.error(f"Push notification error: {e}")
+            logger.error(f"[PushNotification] Push notification error: {e}")
             return None
 
 
