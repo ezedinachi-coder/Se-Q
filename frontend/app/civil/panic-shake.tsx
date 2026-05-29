@@ -100,12 +100,30 @@ export default function PanicShake() {
   const bgFlash   = useRef(new Animated.Value(0)).current;
 
   // ── Escape-hatch ──────────────────────────────────────────────────────────
+  // Runs on mount AND every time the app foregrounds. If AsyncStorage already
+  // shows a completed panic (written by a prior activation that succeeded but
+  // then crashed before navigating), route home immediately.
+  //
+  // FIX: Removed the `if (!activatingRef.current) return` gate that was here.
+  // That gate meant the check only ran if activateWithCategory() had already
+  // been called — i.e. never on a fresh mount caused by checkNativePanic
+  // re-routing here after a banner mishandle. The user would land here, the
+  // gate would short-circuit, and they'd be trapped with no exit.
   useEffect(() => {
     const check = async () => {
-      if (!activatingRef.current) return;
       const panicActive = await AsyncStorage.getItem('panic_active');
       const activePanic = await AsyncStorage.getItem('active_panic');
-      if (panicActive === 'true' || !!activePanic) router.replace('/civil/home');
+      if (panicActive === 'true' || !!activePanic) {
+        router.replace('/civil/home');
+        return;
+      }
+      // Also escape if a previous activation attempt left a panic_error
+      // sentinel — clear it and go home rather than looping.
+      const panicError = await AsyncStorage.getItem('panic_error');
+      if (panicError === 'true') {
+        await AsyncStorage.removeItem('panic_error');
+        router.replace('/civil/home');
+      }
     };
 
     check();
@@ -247,11 +265,16 @@ export default function PanicShake() {
         await clearAuthData();
         router.replace('/auth/login');
       } else {
-        setActivated(true);
-        setTimeout(() => {
-          if (Platform.OS === 'android') BackHandler.exitApp();
-          else router.replace('/civil/home');
-        }, 600);
+        // FIX: write a sentinel so the escape-hatch on next mount routes home
+        // instead of looping, and consume the native pending flag so
+        // checkNativePanic on cold-start doesn't re-route to panic-shake.
+        try {
+          await AsyncStorage.setItem('panic_error', 'true');
+          const { checkAndConsumePanic } = await import('../../utils/nativePanicBridge');
+          await checkAndConsumePanic().catch(() => {});
+        } catch (_) {}
+        // Navigate home — don't fake-show "activated" for a failed attempt
+        router.replace('/civil/home');
       }
     }
   }, []);
