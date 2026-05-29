@@ -43,6 +43,25 @@ export default function SecurityNearby() {
     loadNearbyUsers();
   }, []);
 
+  // Auto-refresh all security agent locations when this screen is opened/refreshed
+  // This ensures the map shows fresh locations for all nearby security agents
+  const triggerLocationRefreshForAll = async () => {
+    try {
+      const token = await getAuthToken();
+      if (!token) return;
+
+      // Call the backend to push location refresh requests to all active security agents
+      await axios.post(`${BACKEND_URL}/api/security/refresh-all-locations`, {}, {
+        headers: { Authorization: `Bearer ${token}` },
+        timeout: 10000,
+      });
+      console.log('[SecurityNearby] Location refresh triggered for all security agents');
+    } catch (error: any) {
+      // Non-critical - don't block the user experience if this fails
+      console.warn('[SecurityNearby] Failed to trigger location refresh:', error?.message);
+    }
+  };
+
   const updateMyLocation = async () => {
     try {
       // FIX: use shared getLocation() — standardises timeout (12s) + last-known fallback
@@ -81,6 +100,9 @@ export default function SecurityNearby() {
 
   const loadNearbyUsers = async () => {
     try {
+      // Trigger location refresh for all security agents (non-blocking)
+      triggerLocationRefreshForAll();
+
       // Update our own live location first so the backend has fresh coords
       // (does NOT block the user list fetch on failure — we fall through)
       await updateMyLocation();
