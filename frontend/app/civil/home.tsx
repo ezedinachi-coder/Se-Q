@@ -288,60 +288,64 @@ export default function CivilHome() {
           }
         } catch (_) {}
 
-        // Deactivate on backend
-        if (token) {
-          await axios.post(
-            `${BACKEND_URL}/api/panic/deactivate`,
-            {},
-            { headers: { Authorization: `Bearer ${token}` }, timeout: 15000 }
-          );
-        }
+        // Helper to deactivate panic with retry
+        const deactivatePanic = async (retries = 2): Promise<boolean> => {
+          if (!token) return false;
 
-        // Clear all local panic state IMMEDIATELY before updating UI
-        await AsyncStorage.multiRemove([
-          'panic_active', 'panic_started_at', 'panic_id', 'active_panic',
-        ]);
-
-        // Update local state FIRST, then sync with backend
-        setHasActivePanic(false);
-
-        // CRITICAL FIX: Tell native service that panic is no longer active
-        await setNativePanicActive(false);
-        console.log('[CivilHome] Native panic active flag set to FALSE');
-
-        // Force re-check with backend to ensure sync
-        // This handles any race conditions where backend state wasn't updated yet
-        if (token) {
-          try {
-            const statusRes = await axios.get(`${BACKEND_URL}/api/panic/status`, {
-              headers: { Authorization: `Bearer ${token}` },
-              timeout: 10000
-            });
-            const backendHasPanic = statusRes.data?.is_active === true;
-            if (backendHasPanic) {
-              // Backend still has active panic - this means deactivate failed silently
-              // Retry deactivate once
-              console.log('[CivilHome] Backend still has panic, retrying deactivate');
-              await axios.post(
+          for (let attempt = 1; attempt <= retries; attempt++) {
+            try {
+              const res = await axios.post(
                 `${BACKEND_URL}/api/panic/deactivate`,
                 {},
                 { headers: { Authorization: `Bearer ${token}` }, timeout: 15000 }
               );
-              // Verify after retry
-              const retryRes = await axios.get(`${BACKEND_URL}/api/panic/status`, {
+              console.log(`[CivilHome] Deactivate attempt ${attempt}: ${res.data?.deactivated_count ?? 0} panics deactivated`);
+
+              // Verify the deactivation worked
+              const statusRes = await axios.get(`${BACKEND_URL}/api/panic/status`, {
                 headers: { Authorization: `Bearer ${token}` },
                 timeout: 10000
               });
-              if (retryRes.data?.is_active !== true) {
-                setHasActivePanic(false);
+
+              if (statusRes.data?.is_active !== true) {
+                console.log('[CivilHome] Deactivation verified - no active panic on backend');
+                return true;
               }
-            } else {
-              setHasActivePanic(false);
+
+              console.log(`[CivilHome] Attempt ${attempt}: Backend still has active panic, retrying...`);
+            } catch (err: any) {
+              console.error(`[CivilHome] Deactivate attempt ${attempt} failed:`, err?.message);
+              if (err?.response?.status === 401) {
+                await clearAuthData();
+                router.replace('/auth/login');
+                return false;
+              }
             }
-          } catch (syncErr) {
-            // Network error - trust local state since we cleared it
-            console.log('[CivilHome] Backend sync check failed, trusting local state');
           }
+          return false;
+        };
+
+        // Perform deactivation with retry
+        const deactivationSuccess = await deactivatePanic(3);
+
+        // Clear all local panic state
+        await AsyncStorage.multiRemove([
+          'panic_active', 'panic_started_at', 'panic_id', 'active_panic',
+        ]);
+
+        // Update local state
+        setHasActivePanic(!deactivationSuccess); // Keep active only if deactivation failed after all retries
+
+        // Tell native service that panic is no longer active
+        await setNativePanicActive(false);
+        console.log('[CivilHome] Native panic active flag set to FALSE');
+
+        if (!deactivationSuccess) {
+          Alert.alert(
+            'Deactivation Issue',
+            'There was a problem communicating with the server. Your panic has been stopped locally. Please try again or contact support if the issue persists.',
+            [{ text: 'OK' }]
+          );
         }
       } catch (err: any) {
         if (err?.response?.status === 401) {
