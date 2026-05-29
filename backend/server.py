@@ -552,28 +552,20 @@ async def attach_ambient_audio(panic_id: str, request: Request, user = Depends(g
 
 @api_router.post("/panic/deactivate")
 async def deactivate_panic(user = Depends(get_current_user)):
-    user_id_str = str(user["_id"])
-    logger.info(f"[Deactivate] User {user_id_str} requesting panic deactivation")
-
     result = await db.panic_events.update_many(
-        {"user_id": user_id_str, "is_active": True},
+        {"user_id": str(user["_id"]), "is_active": True},
         {"$set": {"is_active": False, "deactivated_at": datetime.utcnow()}}
     )
-
-    logger.info(f"[Deactivate] Deactivated {result.modified_count} panic events for user {user_id_str}")
     return {"ok": True, "deactivated_count": result.modified_count}
 
 @api_router.get("/panic/status")
 async def get_panic_status(user = Depends(get_current_user)):
-    user_id_str = str(user["_id"])
     panic = await db.panic_events.find_one(
-        {"user_id": user_id_str, "is_active": True}
+        {"user_id": str(user["_id"]), "is_active": True}
     )
     if not panic:
-        logger.info(f"[Status] No active panic for user {user_id_str}")
         return {"is_active": False}
-
-    logger.info(f"[Status] Active panic found for user {user_id_str}: panic_id={str(panic['_id'])}")
+    
     return {
         "is_active": True,
         "panic_id": str(panic["_id"]),
@@ -1604,6 +1596,40 @@ async def security_ping_user(uid: str, user=Depends(get_current_user)):
         )
     return {"ok": True}
 
+
+# ── Ping all security agents (admin OR security role) ──────────────────────────
+# Sends a silent push to every active security user's device.
+# Each device's notification handler should call POST /security/update-location
+# with fresh GPS, making the security-map and nearby views current on next fetch.
+@api_router.post("/admin/ping-all-security")
+async def ping_all_security(user=Depends(get_current_user)):
+    if user.get("role") not in ("admin", "security"):
+        raise HTTPException(status_code=403, detail="Admin or security only")
+
+    cursor = db.users.find({"role": "security", "is_active": True})
+    pinged = 0
+    failed = 0
+    requester_name = user.get("full_name") or user.get("email") or "Operations"
+
+    async for agent in cursor:
+        push_token = agent.get("push_token")
+        if not push_token:
+            failed += 1
+            continue
+        try:
+            if expo_push_service:
+                await expo_push_service.send_push_notification(
+                    token=push_token,
+                    title="📍 Location Request",
+                    body=f"{requester_name} requests your current location",
+                    data={"type": "location_ping"},   # handled by app background handler
+                )
+            pinged += 1
+        except Exception:
+            failed += 1
+
+    return {"ok": True, "pinged": pinged, "failed": failed}
+
 # ================== CHAT ==================
 @api_router.get("/chat/conversations")
 async def get_conversations(user=Depends(get_current_user)):
@@ -1715,40 +1741,16 @@ async def send_message(body: dict = Body(...), user=Depends(get_current_user)):
 
     conv = await db.chat_conversations.find_one({"_id": ObjectId(conv_id)})
     inc_fields: dict = {}
-    recipients_to_notify = []
     if conv:
         for pid in conv.get("participants", []):
             if pid != uid:
                 inc_fields[f"unread_{pid}"] = 1
-                recipients_to_notify.append(pid)
 
     update: dict = {"$set": {"last_message": content, "last_message_at": now}}
     if inc_fields:
         update["$inc"] = inc_fields  # type: ignore[assignment]
 
     await db.chat_conversations.update_one({"_id": ObjectId(conv_id)}, update)
-
-    # Send push notification to recipient(s) so they get notified even when app is closed
-    for recipient_id in recipients_to_notify:
-        try:
-            recipient = await db.users.find_one({"_id": ObjectId(recipient_id)})
-            if recipient and recipient.get("push_token") and expo_push_service:
-                sender_name = user.get("full_name") or user.get("email", "Someone")
-                await expo_push_service.send_push_notification(
-                    token=recipient["push_token"],
-                    title=f"💬 {sender_name}",
-                    body=content[:100] if len(content) > 100 else content,  # Truncate long messages
-                    data={
-                        "type": "chat_message",
-                        "conversation_id": conv_id,
-                        "from_user_id": uid,
-                        "from_name": sender_name,
-                    }
-                )
-                logger.info(f"[Chat] Push notification sent to {recipient.get('email')} for conv {conv_id}")
-        except Exception as e:
-            logger.error(f"[Chat] Failed to send push notification to {recipient_id}: {e}")
-
     return {"ok": True, "conversation_id": conv_id}
 
 @api_router.post("/chat/mark-read")
@@ -1928,7 +1930,9 @@ async def admin_security_map(user=Depends(get_admin_user)):
     cursor = db.users.find({"role": "security"})
     security_users = []
     async for u in cursor:
-        loc = u.get("team_location") or u.get("current_location") or {}
+        # Prefer live current_location (from update-location / ping response) over
+        # the static team_location that the officer set manually.
+        loc = u.get("current_location") or u.get("team_location") or {}
         lat = loc.get("latitude")
         lng = loc.get("longitude")
         coords = [lng, lat] if lat is not None and lng is not None else None
@@ -1946,6 +1950,8 @@ async def admin_security_map(user=Depends(get_admin_user)):
             "updated_at": u.get("location_updated_at", u.get("created_at", "")).isoformat()
                           if isinstance(u.get("location_updated_at") or u.get("created_at"), datetime)
                           else None,
+            "security_sub_role": u.get("security_sub_role"),
+            "phone": u.get("phone"),
         })
     return {"security_users": security_users}
 
@@ -2060,60 +2066,6 @@ async def security_nearby(user=Depends(get_current_user)):
         })
 
     return {"panics": panics, "reports": reports}
-
-@api_router.post("/security/refresh-all-locations")
-async def security_refresh_all_locations(user=Depends(get_current_user)):
-    """
-    Push a location-update request to ALL active security agents.
-
-    When a Security/Admin opens NEARBY SECURITY or SECURITY MAP, this endpoint
-    is called to trigger location refresh for all agents. Each agent's app
-    receives a push notification and updates their location via GPS.
-
-    Returns the count of agents that were notified.
-    """
-    if user.get("role") not in ("security", "admin"):
-        raise HTTPException(status_code=403, detail="Security or admin only")
-
-    logger.info(f"[RefreshLocations] Requested by {user.get('email')} ({user.get('role')})")
-
-    # Find all active security agents with push tokens
-    # Active = has a push_token AND (is_active OR recent location update)
-    active_timeout = datetime.utcnow() - timedelta(minutes=10)
-
-    security_users = await db.users.find({
-        "role": "security",
-        "push_token": {"$exists": True, "$ne": None},
-        "$or": [
-            {"is_active": True},
-            {"location_updated_at": {"$gte": active_timeout}}
-        ]
-    }).to_list(None)
-
-    notified_count = 0
-    for sec_user in security_users:
-        # Don't notify the user who requested the refresh (they'll update naturally)
-        if str(sec_user["_id"]) == str(user["_id"]):
-            continue
-
-        try:
-            if expo_push_service and sec_user.get("push_token"):
-                await expo_push_service.send_push_notification(
-                    token=sec_user["push_token"],
-                    title="📍 Location Update Requested",
-                    body="Your location is being refreshed for nearby security map",
-                    data={"type": "location_refresh", "action": "update_location"}
-                )
-                notified_count += 1
-        except Exception as e:
-            logger.error(f"[RefreshLocations] Failed to notify {sec_user.get('email')}: {e}")
-
-    logger.info(f"[RefreshLocations] Notified {notified_count} security agents")
-    return {
-        "ok": True,
-        "notified_count": notified_count,
-        "message": f"Location refresh requested for {notified_count} security agents"
-    }
 
 @api_router.get("/security/nearby-security")
 async def security_nearby_security(user=Depends(get_current_user)):
