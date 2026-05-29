@@ -470,6 +470,31 @@ function AppContent() {
     }
   }, []);
 
+  // ── Location refresh (push-notification triggered by nearby security/admin) ──
+  // When Security/Admin views NEARBY SECURITY or SECURITY MAP, the backend sends
+  // push notifications to all active security agents to refresh their locations.
+
+  const refreshMyLocation = useCallback(async () => {
+    try {
+      const token = await getAuthToken();
+      if (!token) return;
+      const coords = await getLocation('soft');
+      if (!coords) return;
+      await fetch(`${BACKEND_URL}/api/security/update-location`, {
+        method:  'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body:    JSON.stringify({
+          latitude:  coords.latitude,
+          longitude: coords.longitude,
+          accuracy:  coords.accuracy,
+        }),
+      });
+      console.log('[LocationRefresh] Location updated for security map');
+    } catch (err) {
+      console.error('[LocationRefresh] Location update failed:', err);
+    }
+  }, []);
+
   useEffect(() => {
     Notifications.setNotificationHandler({
       handleNotification: async () => ({
@@ -481,9 +506,11 @@ function AppContent() {
     const subscription = Notifications.addNotificationReceivedListener((notification) => {
       const data = notification.request.content.data;
       if (data?.type === 'ping') sendPingLocation();
+      // Handle location refresh request from security map
+      if (data?.type === 'location_refresh') refreshMyLocation();
     });
     return () => subscription.remove();
-  }, [sendPingLocation]);
+  }, [sendPingLocation, refreshMyLocation]);
 
   // ── Render ─────────────────────────────────────────────────────────────────
 
