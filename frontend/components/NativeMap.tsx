@@ -282,6 +282,8 @@ const map = new maplibregl.Map({
   style: buildStyle(currentStyle),
   center: [INIT_LNG, INIT_LAT],
   zoom: INIT_ZOOM,
+  minZoom: 2,
+  maxZoom: 19,  // Allow up to ~5m resolution on Esri satellite
   bearing: 0,
   pitch: 0,
   attributionControl: false,
@@ -417,7 +419,8 @@ window.addEventListener('message', (event) => {
   try {
     const cmd = JSON.parse(event.data);
     if (cmd.type === 'flyTo') {
-      map.flyTo({ center: [cmd.lng, cmd.lat], zoom: cmd.zoom || INIT_ZOOM, duration: 600 });
+      const targetZoom = Math.max(2, Math.min(cmd.zoom || INIT_ZOOM, 19));
+      map.flyTo({ center: [cmd.lng, cmd.lat], zoom: targetZoom, duration: 600 });
     }
   } catch (_) {}
 });
