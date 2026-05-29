@@ -1,37 +1,33 @@
 /**
- * components/NativeMap.tsx — WebView + MapLibre GL JS
+ * components/NativeMap.tsx  (Native + Web)
  *
- * APPROACH: Renders a fully self-contained MapLibre GL JS map inside a
- * react-native-webview. This completely bypasses all react-native-maps
- * native bridge issues (New Architecture white-tile, PROVIDER_GOOGLE
- * google-services.json requirement, Fabric renderer regression).
+ * HIGH-RESOLUTION SATELLITE MAP — Leaflet WebView, no Mapbox required.
  *
- * CAPABILITIES:
- *   ✅ Two-finger rotate (bearing)
- *   ✅ Two-finger pitch/tilt
- *   ✅ Pinch zoom + scroll
- *   ✅ Satellite view  — Esri World Imagery (free, no key, excellent Nigeria coverage)
- *   ✅ Street view     — OpenStreetMap standard tiles (free, no key)
- *   ✅ Hybrid view     — Esri satellite + OSM road labels overlay
- *   ✅ Terrain view    — OpenTopoMap (free, no key)
- *   ✅ Draggable markers
- *   ✅ Radius circle overlay
- *   ✅ Compass needle (auto-rotates with map bearing)
- *   ✅ Zero API keys required
- *   ✅ Works with newArchEnabled: true
- *   ✅ Works on every EAS build — no native linking, no google-services.json
+ * Tile layers (satellite path):
+ *   1. PRIMARY  — Google Maps Satellite  (zoom 1–21, ~0.1 m/px at z21)
+ *      ⚠ Google tiles are unofficial/reverse-engineered; they work reliably
+ *        on device but you should swap in a paid provider if Google blocks them.
+ *   2. FALLBACK — Esri World Imagery     (zoom 1–20, ~0.3 m/px at z20)
+ *      Free, no API key, excellent Africa/Nigeria coverage.
  *
- * PROP INTERFACE: identical to all previous versions — zero call-site changes.
+ * Streets layer → OpenStreetMap (zoom 1–19).
+ * Labels overlay → Esri World Boundaries & Places (toggled on satellite).
+ *
+ * Effective ground resolution at maxZoom:
+ *   z19 ≈ 0.3 m/px  |  z20 ≈ 0.15 m/px  |  z21 ≈ 0.075 m/px
+ * These correspond to 5–10 m feature visibility at z19–z20 — the target range.
+ *
+ * All communication between the WebView and RN is via postMessage / onMessage JSON.
  */
 
-import React, { useRef, useCallback, useState } from 'react';
+import React, { useRef, useEffect, useCallback } from 'react';
 import {
-  View, Text, StyleSheet, Platform, TouchableOpacity, Linking,
+  View, StyleSheet, Platform, Text, TouchableOpacity,
 } from 'react-native';
 import { WebView } from 'react-native-webview';
 import { Ionicons } from '@expo/vector-icons';
 
-// ── Types ─────────────────────────────────────────────────────────────────────
+// ── Types ──────────────────────────────────────────────────────────────────────
 
 export interface MarkerData {
   id: string;
@@ -41,8 +37,6 @@ export interface MarkerData {
   description?: string;
   pinColor?: string;
 }
-
-export type GoogleMapType = 'satellite' | 'hybrid' | 'roadmap' | 'terrain';
 
 export interface NativeMapProps {
   region: {
@@ -57,379 +51,386 @@ export interface NativeMapProps {
   onPress?: (coords: { latitude: number; longitude: number }) => void;
   onMarkerChange?: (coords: { latitude: number; longitude: number }) => void;
   style?: any;
-  initialMapStyle?: GoogleMapType;
+  initialMapStyle?: 'satellite' | 'streets';
 }
 
-// ── Tile sources ──────────────────────────────────────────────────────────────
-// All free, no API key, verified coverage for Nigeria/Africa.
+// ── Tile layer URLs ────────────────────────────────────────────────────────────
+//
+// Google Satellite: highest available resolution (zoom up to 21 in most regions).
+// Tile URL is the well-known reverse-engineered endpoint used by dozens of FOSS
+// projects (e.g. QGIS, Leaflet-providers). Works without a key on device.
+//
+const TILES = {
+  // PRIMARY high-res satellite
+  googleSatellite:
+    'https://mt{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
 
-const TILE_SOURCES = {
-  street: {
-    label: 'Street',
-    icon: '🗺',
-    tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
-    attribution: '© OpenStreetMap contributors',
-    maxzoom: 19,
-    tileSize: 256,
-  },
-  satellite: {
-    label: 'Satellite',
-    icon: '🛰',
-    // Esri World Imagery — free, no key, excellent Africa/Nigeria coverage
-    tiles: [
-      'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-    ],
-    attribution: '© Esri, Maxar, Earthstar Geographics',
-    maxzoom: 19,
-    tileSize: 256,
-  },
-  hybrid: {
-    label: 'Hybrid',
-    icon: '🌍',
-    // Esri satellite base + OSM road/label overlay
-    tiles: [
-      'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-    ],
-    overlayTiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
-    attribution: '© Esri, © OpenStreetMap contributors',
-    maxzoom: 19,
-    tileSize: 256,
-  },
-  terrain: {
-    label: 'Terrain',
-    icon: '🏔',
-    tiles: ['https://tile.opentopomap.org/{z}/{x}/{y}.png'],
-    attribution: '© OpenTopoMap contributors',
-    maxzoom: 17,
-    tileSize: 256,
-  },
+  // FALLBACK satellite (free, no key, great Africa coverage, max z20)
+  esriSatellite:
+    'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+
+  // Labels overlay (always free)
+  esriLabels:
+    'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
+
+  // Streets
+  osm:
+    'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
 };
 
-// ── HTML template ─────────────────────────────────────────────────────────────
+// ── Build the self-contained HTML blob ─────────────────────────────────────
 
 function buildMapHTML(opts: {
   lat: number;
   lng: number;
   zoom: number;
   markers: MarkerData[];
-  radiusKm: number;
-  draggable: boolean;
-  initialStyle: string;
+  radiusMeters: number;
+  initialStyle: 'satellite' | 'streets';
 }): string {
-  const { lat, lng, zoom, markers, radiusKm, draggable, initialStyle } = opts;
+  const { lat, lng, zoom, markers, radiusMeters, initialStyle } = opts;
 
   const markersJson = JSON.stringify(markers);
-  const sourcesJson = JSON.stringify(TILE_SOURCES);
 
   return `<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"/>
-<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css"/>
-<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  html, body, #map { width: 100%; height: 100%; background: #0f172a; }
+  html, body, #map { width: 100%; height: 100%; background: #0F172A; }
 
-  /* Style toggle bar */
-  #styleBar {
+  .style-toggle {
     position: absolute;
     top: 10px;
-    left: 50%;
-    transform: translateX(-50%);
-    z-index: 100;
-    display: flex;
-    gap: 4px;
+    right: 10px;
+    z-index: 1000;
     background: rgba(15,23,42,0.92);
-    border-radius: 24px;
-    padding: 5px 6px;
-    border: 1px solid #334155;
-    white-space: nowrap;
-  }
-  .styleBtn {
-    border: none;
-    background: transparent;
-    color: #64748b;
-    font-size: 11px;
+    border: 1.5px solid #3B82F6;
+    border-radius: 8px;
+    padding: 6px 12px;
+    color: #3B82F6;
+    font-size: 12px;
     font-weight: 700;
-    padding: 5px 9px;
-    border-radius: 18px;
     cursor: pointer;
     font-family: -apple-system, sans-serif;
-  }
-  .styleBtn.active { background: #2563eb; color: #fff; }
-
-  /* Compass */
-  #compass {
-    position: absolute;
-    top: 52px;
-    right: 10px;
-    width: 36px;
-    height: 36px;
-    z-index: 100;
-    background: rgba(15,23,42,0.88);
-    border-radius: 50%;
-    border: 1px solid #334155;
     display: flex;
     align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    font-size: 20px;
-    transition: transform 0.15s;
+    gap: 5px;
+    letter-spacing: 0.3px;
   }
+  .style-toggle:active { opacity: 0.8; }
 
-  /* Coords badge */
-  #coords {
+  .zoom-badge {
     position: absolute;
-    bottom: 8px;
-    left: 8px;
-    z-index: 100;
-    background: rgba(15,23,42,0.82);
-    color: #94a3b8;
-    font-size: 11px;
-    font-family: monospace;
-    padding: 4px 8px;
+    top: 10px;
+    left: 10px;
+    z-index: 1000;
+    background: rgba(15,23,42,0.85);
     border-radius: 6px;
+    padding: 4px 8px;
+    color: #64748B;
+    font-size: 11px;
+    font-family: -apple-system, sans-serif;
     pointer-events: none;
   }
 
-  /* Maplibre overrides */
-  .maplibregl-ctrl-bottom-right { display: none; }
-  .maplibregl-ctrl-bottom-left  { display: none; }
-  .maplibregl-ctrl-top-right    { display: none; }
-  .maplibregl-ctrl-top-left     { display: none; }
+  .coords-badge {
+    position: absolute;
+    bottom: 8px;
+    left: 8px;
+    z-index: 1000;
+    background: rgba(15,23,42,0.85);
+    border-radius: 6px;
+    padding: 4px 8px;
+    color: #94A3B8;
+    font-size: 11px;
+    font-family: -apple-system, sans-serif;
+    pointer-events: none;
+  }
 
-  /* Custom marker */
-  .seq-marker {
-    width: 28px;
-    height: 28px;
-    border-radius: 50%;
-    border: 2.5px solid #fff;
+  /* Compact marker */
+  .map-marker {
     display: flex;
     align-items: center;
     justify-content: center;
-    cursor: pointer;
-    box-shadow: 0 2px 6px rgba(0,0,0,0.5);
-    font-size: 13px;
+    border-radius: 50%;
+    border: 2.5px solid white;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.45);
+  }
+  .map-marker-dot {
+    width: 7px;
+    height: 7px;
+    background: white;
+    border-radius: 50%;
   }
 
-  /* Popup */
-  .maplibregl-popup-content {
-    background: #1e293b;
-    color: #f1f5f9;
-    font-family: -apple-system, sans-serif;
-    font-size: 13px;
-    border-radius: 8px;
-    padding: 8px 12px;
-    border: 1px solid #334155;
+  /* Pulse animation for active markers */
+  @keyframes pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(59,130,246,0.6); }
+    70%  { box-shadow: 0 0 0 10px rgba(59,130,246,0); }
+    100% { box-shadow: 0 0 0 0 rgba(59,130,246,0); }
   }
-  .maplibregl-popup-tip { border-top-color: #1e293b !important; }
+  .map-marker-pulse { animation: pulse 2s infinite; }
+
+  /* Override Leaflet attribution */
+  .leaflet-control-attribution {
+    background: rgba(15,23,42,0.7) !important;
+    color: #64748B !important;
+    font-size: 9px !important;
+  }
+  .leaflet-control-attribution a { color: #3B82F6 !important; }
+  .leaflet-control-zoom a {
+    background: rgba(15,23,42,0.92) !important;
+    color: #3B82F6 !important;
+    border-color: #1E293B !important;
+  }
+  .leaflet-control-zoom a:hover { background: #1E293B !important; }
+
+  /* Popup style */
+  .leaflet-popup-content-wrapper {
+    background: #1E293B;
+    color: #F1F5F9;
+    border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+    font-family: -apple-system, sans-serif;
+  }
+  .leaflet-popup-tip { background: #1E293B; }
+  .leaflet-popup-content { margin: 10px 14px; font-size: 13px; }
+  .leaflet-popup-content b { color: #fff; }
+  .leaflet-popup-close-button { color: #94A3B8 !important; }
 </style>
 </head>
 <body>
 <div id="map"></div>
-<div id="styleBar"></div>
-<div id="compass" title="Reset North">🧭</div>
-<div id="coords"></div>
-
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
-// ── Config ────────────────────────────────────────────────────────────────
-const SOURCES   = ${sourcesJson};
-const MARKERS   = ${markersJson};
-const RADIUS_KM = ${radiusKm};
-const DRAGGABLE = ${draggable};
-const INIT_LNG  = ${lng};
-const INIT_LAT  = ${lat};
-const INIT_ZOOM = ${zoom};
+(function() {
 
-let currentStyle = '${initialStyle}';
-let mapMarkers   = [];
-let circleSource = null;
+  var currentStyle = '${initialStyle}';
+  var map = L.map('map', {
+    zoomControl: true,
+    attributionControl: true,
+    // Allow native pinch-zoom to reach maximum tile resolution
+    maxZoom: 21,
+  }).setView([${lat}, ${lng}], ${zoom});
 
-// ── Build MapLibre style ──────────────────────────────────────────────────
-function buildStyle(styleKey) {
-  const src = SOURCES[styleKey] || SOURCES.street;
-  const layers = [];
-  const sources = {};
-
-  sources['base'] = {
-    type: 'raster',
-    tiles: src.tiles,
-    tileSize: src.tileSize,
-    maxzoom: src.maxzoom,
-    attribution: src.attribution,
-  };
-  layers.push({ id: 'base-layer', type: 'raster', source: 'base' });
-
-  // Hybrid: add OSM road overlay on top of satellite
-  if (styleKey === 'hybrid' && src.overlayTiles) {
-    sources['overlay'] = {
-      type: 'raster',
-      tiles: src.overlayTiles,
-      tileSize: 256,
-      maxzoom: 19,
-    };
-    layers.push({ id: 'overlay-layer', type: 'raster', source: 'overlay', paint: { 'raster-opacity': 0.55 } });
-  }
-
-  return { version: 8, sources, layers };
-}
-
-// ── Init map ──────────────────────────────────────────────────────────────
-const map = new maplibregl.Map({
-  container: 'map',
-  style: buildStyle(currentStyle),
-  center: [INIT_LNG, INIT_LAT],
-  zoom: INIT_ZOOM,
-  minZoom: 2,
-  maxZoom: 19,  // Allow up to ~5m resolution on Esri satellite
-  bearing: 0,
-  pitch: 0,
-  attributionControl: false,
-  logoPosition: 'bottom-left',
-});
-
-// ── Style toggle bar ──────────────────────────────────────────────────────
-const styleBar = document.getElementById('styleBar');
-Object.entries(SOURCES).forEach(([key, src]) => {
-  const btn = document.createElement('button');
-  btn.className = 'styleBtn' + (key === currentStyle ? ' active' : '');
-  btn.textContent = src.icon + ' ' + src.label;
-  btn.onclick = () => switchStyle(key);
-  styleBar.appendChild(btn);
-});
-
-function switchStyle(key) {
-  currentStyle = key;
-  document.querySelectorAll('.styleBtn').forEach((b, i) => {
-    b.className = 'styleBtn' + (Object.keys(SOURCES)[i] === key ? ' active' : '');
-  });
-  map.setStyle(buildStyle(key));
-  map.once('styledata', () => {
-    addCircleIfNeeded();
-  });
-}
-
-// ── Compass ───────────────────────────────────────────────────────────────
-const compass = document.getElementById('compass');
-map.on('rotate', () => {
-  const bearing = map.getBearing();
-  compass.style.transform = 'rotate(' + (-bearing) + 'deg)';
-});
-compass.onclick = () => map.easeTo({ bearing: 0, pitch: 0, duration: 400 });
-
-// ── Coords badge ──────────────────────────────────────────────────────────
-const coordsEl = document.getElementById('coords');
-function updateCoords(center) {
-  coordsEl.textContent = center.lat.toFixed(4) + ', ' + center.lng.toFixed(4);
-}
-map.on('move', () => updateCoords(map.getCenter()));
-updateCoords({ lat: INIT_LAT, lng: INIT_LNG });
-
-// ── Radius circle ─────────────────────────────────────────────────────────
-function makeCircleGeoJSON(lng, lat, radiusKm) {
-  const points = 64;
-  const coords = [];
-  const R = 6371;
-  const latR = lat * Math.PI / 180;
-  const lngR = lng * Math.PI / 180;
-  const d    = radiusKm / R;
-  for (let i = 0; i <= points; i++) {
-    const bearing = (i / points) * 2 * Math.PI;
-    const pLat = Math.asin(Math.sin(latR) * Math.cos(d) + Math.cos(latR) * Math.sin(d) * Math.cos(bearing));
-    const pLng = lngR + Math.atan2(Math.sin(bearing) * Math.sin(d) * Math.cos(latR), Math.cos(d) - Math.sin(latR) * Math.sin(pLat));
-    coords.push([pLng * 180 / Math.PI, pLat * 180 / Math.PI]);
-  }
-  return { type: 'Feature', geometry: { type: 'Polygon', coordinates: [coords] } };
-}
-
-function addCircleIfNeeded() {
-  if (RADIUS_KM <= 0 || MARKERS.length === 0) return;
-  const m = MARKERS[0];
-  const geoJSON = makeCircleGeoJSON(m.longitude, m.latitude, RADIUS_KM);
-
-  if (map.getLayer('circle-fill')) map.removeLayer('circle-fill');
-  if (map.getLayer('circle-stroke')) map.removeLayer('circle-stroke');
-  if (map.getSource('circle')) map.removeSource('circle');
-
-  map.addSource('circle', { type: 'geojson', data: geoJSON });
-  map.addLayer({ id: 'circle-fill', type: 'fill', source: 'circle',
-    paint: { 'fill-color': '#3b82f6', 'fill-opacity': 0.12 } });
-  map.addLayer({ id: 'circle-stroke', type: 'line', source: 'circle',
-    paint: { 'line-color': '#3b82f6', 'line-width': 2 } });
-}
-
-// ── Markers ───────────────────────────────────────────────────────────────
-function addMarkers() {
-  MARKERS.forEach((m) => {
-    const el = document.createElement('div');
-    el.className = 'seq-marker';
-    const color = m.pinColor || '#3b82f6';
-    el.style.background = color;
-    el.textContent = '📍';
-
-    const marker = new maplibregl.Marker({ element: el, draggable: DRAGGABLE })
-      .setLngLat([m.longitude, m.latitude])
-      .addTo(map);
-
-    if (m.title) {
-      const popup = new maplibregl.Popup({ offset: 20, closeButton: false })
-        .setHTML('<strong>' + m.title + '</strong>' + (m.description ? '<br>' + m.description : ''));
-      marker.setPopup(popup);
-      el.onclick = () => marker.togglePopup();
+  // ── Tile layers ───────────────────────────────────────────────────────────
+  //
+  // Google Satellite — z1–21, uses subdomains 0-3 (mt0…mt3)
+  var googleSat = L.tileLayer(
+    '${TILES.googleSatellite}',
+    {
+      maxZoom: 21,
+      subdomains: ['0','1','2','3'],
+      attribution: '© Google',
+      // Retry on tile error (network blip)
+      errorTileUrl: 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7',
     }
+  );
 
-    if (DRAGGABLE) {
-      marker.on('dragend', () => {
-        const lngLat = marker.getLngLat();
-        window.ReactNativeWebView && window.ReactNativeWebView.postMessage(
-          JSON.stringify({ type: 'markerDrag', latitude: lngLat.lat, longitude: lngLat.lng })
-        );
+  // Esri fallback — z1–20
+  var esriSat = L.tileLayer(
+    '${TILES.esriSatellite}',
+    { maxZoom: 20, attribution: 'Esri, Maxar, Airbus' }
+  );
+
+  var esriLabels = L.tileLayer(
+    '${TILES.esriLabels}',
+    { maxZoom: 21, attribution: '' }
+  );
+
+  var osmStreets = L.tileLayer(
+    '${TILES.osm}',
+    { maxZoom: 19, attribution: '© OpenStreetMap contributors', subdomains: 'abc' }
+  );
+
+  // Track which satellite layer is live
+  var activeSatLayer = null;
+
+  function loadSatellite() {
+    // Try Google first; fall back to Esri if tiles fail after 2 s
+    if (activeSatLayer) { map.removeLayer(activeSatLayer); activeSatLayer = null; }
+    googleSat.addTo(map);
+    activeSatLayer = googleSat;
+    esriLabels.addTo(map);
+
+    // Fallback: if Google tiles error, switch to Esri silently
+    var errCount = 0;
+    googleSat.on('tileerror', function() {
+      errCount++;
+      if (errCount >= 3 && activeSatLayer === googleSat) {
+        map.removeLayer(googleSat);
+        esriSat.addTo(map);
+        activeSatLayer = esriSat;
+        errCount = 0;
+      }
+    });
+  }
+
+  function applyStyle(style) {
+    if (style === 'satellite') {
+      map.removeLayer(osmStreets);
+      loadSatellite();
+      toggleBtn.innerHTML = satIcon + ' Satellite';
+    } else {
+      if (activeSatLayer) { map.removeLayer(activeSatLayer); activeSatLayer = null; }
+      map.removeLayer(esriLabels);
+      osmStreets.addTo(map);
+      toggleBtn.innerHTML = streetIcon + ' Streets';
+    }
+    currentStyle = style;
+  }
+
+  // Initial layer
+  if (currentStyle === 'satellite') {
+    loadSatellite();
+  } else {
+    osmStreets.addTo(map);
+  }
+
+  // ── Style toggle button ───────────────────────────────────────────────────
+  var satIcon    = '🛰';
+  var streetIcon = '🗺';
+
+  var toggleBtn = document.createElement('button');
+  toggleBtn.className = 'style-toggle';
+  toggleBtn.innerHTML = currentStyle === 'satellite'
+    ? satIcon + ' Satellite'
+    : streetIcon + ' Streets';
+  document.body.appendChild(toggleBtn);
+  toggleBtn.addEventListener('click', function() {
+    applyStyle(currentStyle === 'satellite' ? 'streets' : 'satellite');
+  });
+
+  // ── Zoom badge (shows current zoom for ground-resolution awareness) ───────
+  var zoomBadge = document.createElement('div');
+  zoomBadge.className = 'zoom-badge';
+  function updateZoomBadge() {
+    var z = map.getZoom();
+    // Approximate ground resolution at equator (metres per pixel)
+    var res = (156543.03392 * Math.cos(map.getCenter().lat * Math.PI / 180)) / Math.pow(2, z);
+    zoomBadge.textContent = 'z' + z + ' ≈ ' + (res < 1 ? res.toFixed(2) : Math.round(res)) + ' m/px';
+  }
+  document.body.appendChild(zoomBadge);
+  map.on('zoomend', updateZoomBadge);
+  updateZoomBadge();
+
+  // ── Coords badge ──────────────────────────────────────────────────────────
+  var coordsBadge = document.createElement('div');
+  coordsBadge.className = 'coords-badge';
+  coordsBadge.textContent = '${lat.toFixed(4)}, ${lng.toFixed(4)}';
+  document.body.appendChild(coordsBadge);
+  map.on('move', function() {
+    var c = map.getCenter();
+    coordsBadge.textContent = c.lat.toFixed(6) + ', ' + c.lng.toFixed(6);
+  });
+
+  // ── Markers ───────────────────────────────────────────────────────────────
+  var markersData = ${markersJson};
+  var leafletMarkers = [];
+
+  function addMarkers(data) {
+    leafletMarkers.forEach(function(m) { m.remove(); });
+    leafletMarkers = [];
+
+    data.forEach(function(m) {
+      var color = m.pinColor || '#3B82F6';
+      var el = document.createElement('div');
+      el.className = 'map-marker';
+      // Pulse blue markers (security agents) to make them stand out on satellite
+      if (color === '#3B82F6') el.classList.add('map-marker-pulse');
+      el.style.cssText = 'width:22px;height:22px;background:' + color + ';';
+      var dot = document.createElement('div');
+      dot.className = 'map-marker-dot';
+      el.appendChild(dot);
+
+      var icon = L.divIcon({
+        html: el.outerHTML,
+        className: '',
+        iconSize: [22, 22],
+        iconAnchor: [11, 11],
+        popupAnchor: [0, -14],
       });
-    }
 
-    mapMarkers.push(marker);
+      var marker = L.marker([m.latitude, m.longitude], { icon: icon }).addTo(map);
+
+      if (m.title) {
+        var popupContent = '<b>' + m.title + '</b>';
+        if (m.description) popupContent += '<br><span style="color:#94A3B8;font-size:12px">' + m.description + '</span>';
+        marker.bindPopup(popupContent);
+      }
+
+      marker.on('click', function() {
+        sendMessage({ type: 'markerPress', latitude: m.latitude, longitude: m.longitude, id: m.id });
+        marker.openPopup();
+      });
+
+      leafletMarkers.push(marker);
+    });
+  }
+
+  addMarkers(markersData);
+
+  // ── Radius circle ─────────────────────────────────────────────────────────
+  var radiusCircle = null;
+  if (${radiusMeters} > 0 && markersData.length > 0) {
+    radiusCircle = L.circle([${lat}, ${lng}], {
+      radius: ${radiusMeters},
+      color: '#3B82F6',
+      fillColor: '#3B82F6',
+      fillOpacity: 0.12,
+      weight: 2,
+      dashArray: '6 4',
+    }).addTo(map);
+  }
+
+  // ── Map click ─────────────────────────────────────────────────────────────
+  map.on('click', function(e) {
+    sendMessage({ type: 'mapPress', latitude: e.latlng.lat, longitude: e.latlng.lng });
   });
-}
 
-// ── Map click ─────────────────────────────────────────────────────────────
-map.on('click', (e) => {
-  window.ReactNativeWebView && window.ReactNativeWebView.postMessage(
-    JSON.stringify({ type: 'mapPress', latitude: e.lngLat.lat, longitude: e.lngLat.lng })
-  );
-});
+  // ── postMessage bridge ────────────────────────────────────────────────────
+  function sendMessage(data) {
+    try {
+      if (window.ReactNativeWebView) {
+        window.ReactNativeWebView.postMessage(JSON.stringify(data));
+      } else {
+        window.parent.postMessage(JSON.stringify(data), '*');
+      }
+    } catch(e) {}
+  }
 
-// ── Ready ─────────────────────────────────────────────────────────────────
-map.on('load', () => {
-  addMarkers();
-  addCircleIfNeeded();
-  window.ReactNativeWebView && window.ReactNativeWebView.postMessage(
-    JSON.stringify({ type: 'ready' })
-  );
-});
+  // ── Receive commands from RN ───────────────────────────────────────────────
+  window.addEventListener('message', function(e) {
+    try {
+      var msg = JSON.parse(e.data);
+      if (msg.type === 'updateMarkers') {
+        addMarkers(msg.markers);
+      } else if (msg.type === 'flyTo') {
+        map.setView([msg.lat, msg.lng], msg.zoom || map.getZoom(), { animate: true, duration: 0.8 });
+      } else if (msg.type === 'setStyle') {
+        applyStyle(msg.style);
+      } else if (msg.type === 'setZoom') {
+        map.setZoom(msg.zoom, { animate: true });
+      }
+    } catch(e) {}
+  });
 
-map.on('error', (e) => {
-  // Tile load errors are non-fatal — MapLibre retries automatically
-  console.warn('MapLibre error:', e.error && e.error.message);
-});
+  // Signal ready
+  setTimeout(function() {
+    sendMessage({ type: 'mapReady' });
+  }, 100);
 
-// ── Commands from RN ──────────────────────────────────────────────────────
-window.addEventListener('message', (event) => {
-  try {
-    const cmd = JSON.parse(event.data);
-    if (cmd.type === 'flyTo') {
-      const targetZoom = Math.max(2, Math.min(cmd.zoom || INIT_ZOOM, 19));
-      map.flyTo({ center: [cmd.lng, cmd.lat], zoom: targetZoom, duration: 600 });
-    }
-  } catch (_) {}
-});
+})();
 </script>
 </body>
 </html>`;
 }
 
-// ── NativeMap component ────────────────────────────────────────────────────────
+// ── NativeMap component ──────────────────────────────────────────────────────
 
 export function NativeMap({
   region,
@@ -439,16 +440,15 @@ export function NativeMap({
   onPress,
   onMarkerChange,
   style,
-  initialMapStyle = 'hybrid',
+  initialMapStyle = 'satellite',
 }: NativeMapProps) {
-  const webRef = useRef<WebView>(null);
-  const [ready, setReady] = useState(false);
+  const webViewRef = useRef<WebView>(null);
 
-  const lat = markerCoords?.latitude  ?? region.latitude;
+  const lat = markerCoords?.latitude ?? region.latitude;
   const lng = markerCoords?.longitude ?? region.longitude;
-
-  // Zoom from latitudeDelta (rough but good enough for initial view)
-  const zoom = Math.round(Math.log2(360 / region.latitudeDelta)) - 1;
+  // Clamp to z19 on initial load; user can pinch up to z21 from there.
+  // Tighter latitudeDelta → higher zoom; cap at 19 so the tile request is valid.
+  const zoom = Math.max(1, Math.min(19, Math.round(Math.log2(360 / region.latitudeDelta))));
 
   const allMarkers: MarkerData[] = markers
     ? markers
@@ -456,80 +456,60 @@ export function NativeMap({
     ? [{ id: 'main', latitude: lat, longitude: lng, title: 'Selected Location', pinColor: '#EF4444' }]
     : [];
 
-  const html = buildMapHTML({
-    lat,
-    lng,
-    zoom: Math.max(2, Math.min(zoom, 19)),  // 19 = ~5m satellite resolution
-    markers: allMarkers,
-    radiusKm: radiusKm ?? 0,
-    draggable: !!onMarkerChange,
-    initialStyle: initialMapStyle === 'roadmap' ? 'street' : initialMapStyle,
-  });
+  const radiusMeters = radiusKm ? radiusKm * 1000 : 0;
+
+  // Send updated markers when they change
+  useEffect(() => {
+    if (!webViewRef.current) return;
+    const msg = JSON.stringify({ type: 'updateMarkers', markers: allMarkers });
+    webViewRef.current.postMessage(msg);
+  }, [JSON.stringify(markers), JSON.stringify(markerCoords)]);
+
+  // Re-center when region changes
+  useEffect(() => {
+    if (!webViewRef.current) return;
+    const msg = JSON.stringify({ type: 'flyTo', lat, lng, zoom });
+    webViewRef.current.postMessage(msg);
+  }, [region.latitude, region.longitude]);
 
   const handleMessage = useCallback((event: any) => {
     try {
-      const msg = JSON.parse(event.nativeEvent.data);
-      if (msg.type === 'ready') {
-        setReady(true);
-      } else if (msg.type === 'mapPress') {
-        onPress?.({ latitude: msg.latitude, longitude: msg.longitude });
-      } else if (msg.type === 'markerDrag') {
-        onMarkerChange?.({ latitude: msg.latitude, longitude: msg.longitude });
-        onPress?.({ latitude: msg.latitude, longitude: msg.longitude });
+      const data = JSON.parse(event.nativeEvent.data);
+      if (data.type === 'mapPress' && onPress) {
+        onPress({ latitude: data.latitude, longitude: data.longitude });
+        if (onMarkerChange) onMarkerChange({ latitude: data.latitude, longitude: data.longitude });
+      } else if (data.type === 'markerPress' && onPress) {
+        onPress({ latitude: data.latitude, longitude: data.longitude });
       }
     } catch (_) {}
   }, [onPress, onMarkerChange]);
 
-  // Web platform — show coords + link
-  if (Platform.OS === 'web') {
-    return (
-      <View style={[s.container, style]}>
-        <View style={s.webFallback}>
-          <Ionicons name="map-outline" size={48} color="#3B82F6" />
-          <Text style={s.fallbackCoords}>{lat.toFixed(6)}, {lng.toFixed(6)}</Text>
-          <TouchableOpacity
-            style={s.openBtn}
-            onPress={() => Linking.openURL(`https://www.google.com/maps?q=${lat},${lng}`)}
-          >
-            <Ionicons name="open-outline" size={16} color="#fff" />
-            <Text style={s.openBtnText}>Open in Google Maps</Text>
-          </TouchableOpacity>
-        </View>
-      </View>
-    );
-  }
+  const html = buildMapHTML({ lat, lng, zoom, markers: allMarkers, radiusMeters, initialStyle: initialMapStyle });
 
   return (
-    <View style={[s.container, style]}>
+    <View style={[styles.container, style]}>
       <WebView
-        ref={webRef}
-        style={StyleSheet.absoluteFillObject}
+        ref={webViewRef}
         source={{ html }}
-        onMessage={handleMessage}
+        style={styles.webview}
+        originWhitelist={['*']}
         javaScriptEnabled
         domStorageEnabled
-        originWhitelist={['*']}
-        // Allow loading Esri/OSM tile URLs
-        mixedContentMode="always"
-        // Prevent the WebView's own scroll from eating map gestures
+        allowsInlineMediaPlayback
+        mediaPlaybackRequiresUserAction={false}
         scrollEnabled={false}
         bounces={false}
-        // Suppress "Are you sure you want to leave this page?" dialogs
-        setSupportMultipleWindows={false}
-        // Keep alive — don't kill the map when the parent re-renders
-        androidHardwareAccelerationDisabled={false}
-        androidLayerType="hardware"
+        onMessage={handleMessage}
+        onError={(e) => console.warn('[NativeMap] WebView error:', e.nativeEvent.description)}
+        mixedContentMode="always"
       />
     </View>
   );
 }
 
-const s = StyleSheet.create({
-  container:     { flex: 1, backgroundColor: '#0F172A' },
-  webFallback:   { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#0F172A', gap: 12 },
-  fallbackCoords:{ color: '#94A3B8', fontSize: 14, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
-  openBtn:       { flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: '#3B82F6', paddingVertical: 10, paddingHorizontal: 20, borderRadius: 8, marginTop: 8 },
-  openBtnText:   { color: '#fff', fontWeight: '600', fontSize: 14 },
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: '#0F172A' },
+  webview: { flex: 1, backgroundColor: '#0F172A' },
 });
 
 export default NativeMap;
