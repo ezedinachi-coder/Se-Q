@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import AsyncStorage from '../../utils/asyncStorageShim';
-import { View, Text, TouchableOpacity, StyleSheet, ScrollView, Alert, ActivityIndicator, BackHandler, Image, RefreshControl } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, ScrollView, Alert, ActivityIndicator, BackHandler, Image } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter, useFocusEffect } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import axios from 'axios';
+import { Audio } from 'expo-av';
 import { getPendingCount, processQueue } from '../../utils/offlineQueue';
 import * as Location from 'expo-location';
 import * as TaskManager from 'expo-task-manager';
@@ -12,15 +13,6 @@ import * as TaskManager from 'expo-task-manager';
 import { getAuthToken, clearAuthData, getUserMetadata } from '../../utils/auth';
 import BACKEND_URL from '../../utils/config';
 import { setNativePanicActive } from '../../utils/nativePanicBridge';
-// FIX BUG-03: removed direct `Audio` import — all sound operations now go
-// through AudioManager so the priority/focus system is actually enforced.
-// FIX BUG-01+02: removed setAlertAudioMode / restorePlaybackAudioMode imports.
-// These standalone helpers bypassed the manager and caused:
-//   BUG-01: message-chime completion reset the session, killing the looping
-//           panic alarm on iOS.
-//   BUG-02: setAlertAudioMode set allowsRecordingIOS:false while the ambient
-//           recorder was capturing a 30-second clip, silently voiding it.
-import { AudioManager, AudioPriority } from '../../utils/AudioManager';
 
 const PANIC_LOCATION_TASK = 'background-location-panic';
 
@@ -37,13 +29,12 @@ export default function CivilHome() {
   const [appDisplayIcon, setAppDisplayIcon] = useState('shield');
   const [unreadMessages, setUnreadMessages] = useState(0);
   const [profilePhoto, setProfilePhoto] = useState<string | null>(null);
-  const [refreshing, setRefreshing] = useState(false);
 
-  const prevUnreadRef = useRef(0);
-  // FIX BUG-03: msgSoundRef removed — AudioManager.playSound() owns the
-  // Sound object lifecycle internally. No local ref needed, no orphan risk.
+  // ── Message sound alert (plays on new unread messages) ───────────────────
+  const prevUnreadRef  = useRef(0);
+  const msgSoundRef    = useRef<Audio.Sound | null>(null);
 
-  // ── Android back: exit app from home ─────────────────────────────────────
+  // ── Android back: exit app from home (never go back to login) ────────────
   useEffect(() => {
     const sub = BackHandler.addEventListener('hardwareBackPress', () => {
       BackHandler.exitApp();
@@ -65,8 +56,10 @@ export default function CivilHome() {
         const count: number = res.data?.count ?? 0;
         setUnreadMessages(count);
 
+        // Play sound alert when new messages arrive (if user hasn't disabled it)
         if (count > prevUnreadRef.current) {
           const soundEnabled = await AsyncStorage.getItem('msg_sound_enabled');
+          // Default ON unless explicitly set to 'false'
           if (soundEnabled !== 'false') {
             playMessageAlert();
           }
@@ -75,57 +68,60 @@ export default function CivilHome() {
       } catch (_) {}
     };
 
-    poll();
+    poll(); // immediate on mount
     const id = setInterval(poll, 15000);
     return () => clearInterval(id);
   }, []);
 
-  // ── Message sound alert ───────────────────────────────────────────────────
-  //
-  // FIX BUG-02 + BUG-01 + BUG-03:
-  //
-  // Previously this called setAlertAudioMode() + Audio.Sound.createAsync()
-  // directly, creating a race with ambientRecorder.ts when a message arrived
-  // during the 30-second ambient capture window:
-  //
-  //   t=0s   Shake panic → ambientRecorder starts → allowsRecordingIOS:true
-  //   t≤15s  New message from security officer
-  //   t≤15s  playMessageAlert() → setAlertAudioMode() → allowsRecordingIOS:false
-  //   t≤15s  iOS kills the in-progress Audio.Recording silently
-  //   t=30s  recording.stopAndUnloadAsync() returns empty/truncated clip
-  //
-  // Fix 1 (BUG-02): Check AudioManager.isRecording() before doing anything.
-  //   If the ambient recorder holds RECORDING-priority focus, skip the chime.
-  //   A security officer's reply arriving during a panic is expected — the
-  //   user is in the middle of activating emergency mode and does not need an
-  //   audio chime competing with that. The message badge will update anyway.
-  //
-  // Fix 2 (BUG-01): AudioManager.playSound() owns the full lifecycle, so
-  //   there is no manual restorePlaybackAudioMode() call in a completion
-  //   callback that could reset the session under a concurrent sound.
-  //
-  // Fix 3 (BUG-03): No local msgSoundRef — AudioManager tracks the Sound
-  //   object internally and cleans it up when the chime finishes naturally.
-  const playMessageAlert = async () => {
-    // FIX BUG-02: do not touch the audio session while the ambient recorder
-    // is capturing. isRecording() returns true when 'ambient_recorder' holds
-    // RECORDING-priority focus (the highest priority level).
-    if (AudioManager.isRecording()) return;
+  // Cleanup message sound on unmount
+  useEffect(() => {
+    return () => {
+      if (msgSoundRef.current) {
+        msgSoundRef.current.unloadAsync().catch(() => {});
+        msgSoundRef.current = null;
+      }
+    };
+  }, []);
 
+  const playMessageAlert = async () => {
     try {
-      await AudioManager.playSound(
-        'https://assets.mixkit.co/active_storage/sfx/2869/2869-preview.mp3',
-        AudioPriority.ALERT,
-        'message_alert',
-        { isLooping: false, volume: 0.85, downloadFirst: true }
+      // Unload previous instance first
+      if (msgSoundRef.current) {
+        await msgSoundRef.current.unloadAsync().catch(() => {});
+        msgSoundRef.current = null;
+      }
+      await Audio.setAudioModeAsync({ playsInSilentModeIOS: true, staysActiveInBackground: false });
+      const { sound } = await Audio.Sound.createAsync(
+        { uri: 'https://assets.mixkit.co/active_storage/sfx/2869/2869-preview.mp3' },
+        { shouldPlay: true, volume: 0.85 }
       );
+      msgSoundRef.current = sound;
+      sound.setOnPlaybackStatusUpdate((status: any) => {
+        if (status.isLoaded && status.didJustFinish) {
+          sound.unloadAsync().catch(() => {});
+          msgSoundRef.current = null;
+          // FIX: Restore audio mode to neutral defaults once the alert tone
+          // finishes. Without this, playsInSilentModeIOS:true persists in the
+          // shared AudioSession — if the user opens AudioReport immediately
+          // after a message alert, the mic session inherits the wrong mode.
+          Audio.setAudioModeAsync({
+            allowsRecordingIOS:         false,
+            playsInSilentModeIOS:       false,
+            staysActiveInBackground:    false,
+            shouldDuckAndroid:          true,
+            playThroughEarpieceAndroid: false,
+          }).catch(() => {});
+        }
+      });
     } catch (_) {}
   };
 
-  // useFocusEffect: refresh all data every time the screen comes into focus
+  // Refresh on every screen focus using expo-router's useFocusEffect
   useFocusEffect(
     useCallback(() => {
       initializeScreen();
+      // Immediately re-poll unread count on focus so badge clears right after
+      // the user reads messages and returns to home.
       const repoll = async () => {
         try {
           const token = await getAuthToken();
@@ -146,34 +142,27 @@ export default function CivilHome() {
   const initializeScreen = async () => {
     setLoading(true);
     console.log('[CivilHome] Initializing screen...');
-
+    
+    // Check authentication first
     const token = await getAuthToken();
     console.log('[CivilHome] Token exists:', !!token);
-
+    
     if (!token) {
       console.log('[CivilHome] No token found, redirecting to login');
       router.replace('/auth/login');
       return;
     }
 
-    const metadata = await getUserMetadata();
-    if (metadata.role === 'security') {
-      router.replace('/security/home');
-      return;
-    }
-    if (metadata.role === 'admin') {
-      router.replace('/admin/dashboard');
-      return;
-    }
-
+    // Check for active panic - sync with backend first, then fallback to local storage
     try {
       const response = await axios.get(`${BACKEND_URL}/api/panic/status`, {
         headers: { Authorization: `Bearer ${token}` },
         timeout: 5000
       });
       const backendHasPanic = response.data?.is_active === true;
-
+      
       if (backendHasPanic) {
+        // Sync local storage with backend
         await AsyncStorage.setItem('active_panic', JSON.stringify({
           panic_id: response.data.panic_id,
           activated_at: response.data.activated_at
@@ -181,6 +170,8 @@ export default function CivilHome() {
         setHasActivePanic(true);
         console.log('[CivilHome] Active panic found on backend, synced locally');
       } else {
+        // No active panic on backend — clear ALL panic keys so the
+        // escape-hatch in panic-active.tsx doesn't bounce the user away
         await AsyncStorage.multiRemove([
           'active_panic', 'panic_active', 'panic_started_at', 'panic_id',
         ]);
@@ -188,11 +179,13 @@ export default function CivilHome() {
         console.log('[CivilHome] No active panic on backend, cleared all local panic state');
       }
     } catch (err) {
+      // Fallback to local storage if backend check fails
       const activePanic = await AsyncStorage.getItem('active_panic');
       setHasActivePanic(!!activePanic);
       console.log('[CivilHome] Backend panic check failed, using local:', !!activePanic);
     }
 
+    // Load app customization
     try {
       const customization = await AsyncStorage.getItem('app_customization');
       if (customization) {
@@ -201,7 +194,7 @@ export default function CivilHome() {
         if (app_logo) setAppDisplayIcon(app_logo);
       }
     } catch (e) {}
-
+    
     await Promise.all([
       checkUserStatus(),
       checkPendingUploads(),
@@ -215,7 +208,7 @@ export default function CivilHome() {
       const metadata = await getUserMetadata();
       setIsPremium(metadata.isPremium);
       console.log('[CivilHome] Local metadata premium:', metadata.isPremium);
-
+      
       const token = await getAuthToken();
       if (token) {
         try {
@@ -223,11 +216,11 @@ export default function CivilHome() {
             headers: { Authorization: `Bearer ${token}`, 'Cache-Control': 'no-cache' },
             timeout: 10000
           });
-
+          
           console.log('[CivilHome] Backend profile response:', response.data?.is_premium);
           const backendPremium = response.data?.is_premium === true;
           setIsPremium(backendPremium);
-
+          
           if (response.data?.full_name) {
             setUserName(response.data.full_name);
           }
@@ -253,17 +246,18 @@ export default function CivilHome() {
     try {
       const token = await getAuthToken();
       if (!token) return;
-
+      
       const response = await axios.get(`${BACKEND_URL}/api/report/my-reports?t=${Date.now()}`, {
         headers: { Authorization: `Bearer ${token}`, 'Cache-Control': 'no-cache' },
         timeout: 10000
       });
-
+      
+      // Backend returns { reports: [...] } — unwrap the array
       const reports: any[] = Array.isArray(response.data)
         ? response.data
         : (response.data?.reports || []);
       setTotalReportCount(reports.length);
-      setMyReports(reports.slice(0, 3));
+      setMyReports(reports.slice(0, 3)); // Show first 3 reports in preview
     } catch (error) {
       console.log('[CivilHome] Could not load reports:', error);
     }
@@ -280,25 +274,13 @@ export default function CivilHome() {
     Alert.alert('Upload Complete', `Processed ${results.length} items`);
   };
 
-  const onRefresh = useCallback(async () => {
-    setRefreshing(true);
-    console.log('[CivilHome] Pull-to-refresh triggered');
-    try {
-      await initializeScreen();
-      console.log('[CivilHome] Refresh completed successfully');
-    } catch (error) {
-      console.error('[CivilHome] Refresh failed:', error);
-      Alert.alert('Refresh Failed', 'Unable to refresh. Please check your internet connection.');
-    } finally {
-      setRefreshing(false);
-    }
-  }, []);
-
   const handlePanicPress = async () => {
     if (hasActivePanic) {
+      // Deactivate directly — no confirmation dialog exposed to bystanders
       try {
         const token = await getAuthToken();
 
+        // Stop background GPS task
         try {
           const taskRunning = await TaskManager.isTaskRegisteredAsync(PANIC_LOCATION_TASK).catch(() => false);
           if (taskRunning) {
@@ -306,6 +288,7 @@ export default function CivilHome() {
           }
         } catch (_) {}
 
+        // Deactivate on backend
         if (token) {
           await axios.post(
             `${BACKEND_URL}/api/panic/deactivate`,
@@ -314,19 +297,16 @@ export default function CivilHome() {
           );
         }
 
+        // Clear all local panic state
         await AsyncStorage.multiRemove([
           'panic_active', 'panic_started_at', 'panic_id', 'active_panic',
         ]);
 
+        // CRITICAL FIX: Tell native service that panic is no longer active
         await setNativePanicActive(false);
         console.log('[CivilHome] Native panic active flag set to FALSE');
 
         setHasActivePanic(false);
-
-        Alert.alert(
-          "You're Safe",
-          "Panic deactivated. Security has been notified that you are safe."
-        );
       } catch (err: any) {
         if (err?.response?.status === 401) {
           await clearAuthData();
@@ -336,6 +316,7 @@ export default function CivilHome() {
         }
       }
     } else {
+      // Start new panic — navigate directly to category picker
       router.push('/civil/panic-active');
     }
   };
@@ -343,15 +324,12 @@ export default function CivilHome() {
   const handleLogout = async () => {
     Alert.alert('Logout', 'Are you sure you want to logout?', [
       { text: 'Cancel', style: 'cancel' },
-      {
-        text: 'Logout',
+      { 
+        text: 'Logout', 
         style: 'destructive',
         onPress: async () => {
           console.log('[CivilHome] Logout initiated');
-          // FIX SOUND-CLASH: stop all AudioManager-tracked sounds before clearing
-          // auth so no orphan sounds bleed into the next dashboard session.
-          await AudioManager.stopAll();
-          await clearAuthData(); // also calls AudioManager.stopAll() internally
+          await clearAuthData();
           router.replace('/auth/login');
         }
       }
@@ -371,25 +349,14 @@ export default function CivilHome() {
 
   return (
     <SafeAreaView style={styles.container}>
-      <ScrollView
-          style={styles.scrollView}
-          contentContainerStyle={styles.scrollContent}
-          refreshControl={
-            <RefreshControl
-              refreshing={refreshing}
-              onRefresh={onRefresh}
-              tintColor="#6366F1"
-              colors={['#6366F1', '#8B5CF6', '#A78BFA']}
-              progressBackgroundColor="#1E293B"
-            />
-          }
-        >
+      <ScrollView style={styles.scrollView}>
         <View style={styles.header}>
           <View>
             <Text style={styles.greeting}>Hello! {userName ? userName.split(' ')[0] : 'User'}</Text>
             <Text style={styles.subGreeting}>Stay safe with {appDisplayName}</Text>
           </View>
           <View style={styles.headerRight}>
+            {/* Shake-to-panic active indicator */}
             <View style={styles.shakeIndicator}>
               <Ionicons name="radio" size={14} color="#10B981" />
               <Text style={styles.shakeIndicatorText}>SHAKE</Text>
@@ -404,8 +371,9 @@ export default function CivilHome() {
           </View>
         </View>
 
-        <TouchableOpacity
-          style={[styles.panicButton, hasActivePanic && styles.panicButtonActive]}
+        {/* Panic Button */}
+        <TouchableOpacity 
+          style={[styles.panicButton, hasActivePanic && styles.panicButtonActive]} 
           onPress={handlePanicPress}
         >
           <Ionicons name={hasActivePanic ? "shield-checkmark" : "alert-circle"} size={48} color="#fff" />
@@ -417,6 +385,7 @@ export default function CivilHome() {
           </Text>
         </TouchableOpacity>
 
+        {/* Quick Actions */}
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Quick Actions</Text>
           <View style={styles.actionsGrid}>
@@ -432,8 +401,8 @@ export default function CivilHome() {
               </View>
               <Text style={styles.actionText}>Audio Report</Text>
             </TouchableOpacity>
-            <TouchableOpacity
-              style={styles.actionCard}
+            <TouchableOpacity 
+              style={styles.actionCard} 
               onPress={() => {
                 if (isPremium) {
                   router.push('/civil/escort');
@@ -474,6 +443,7 @@ export default function CivilHome() {
           </View>
         </View>
 
+        {/* My Reports Preview */}
         <View style={styles.section}>
           <View style={styles.sectionHeader}>
             <Text style={styles.sectionTitle}>My Reports ({totalReportCount})</Text>
@@ -507,6 +477,7 @@ export default function CivilHome() {
           )}
         </View>
 
+        {/* Pending Uploads */}
         {pendingUploads > 0 && (
           <View style={styles.section}>
             <View style={styles.pendingCard}>
@@ -519,6 +490,7 @@ export default function CivilHome() {
           </View>
         )}
 
+        {/* Logout */}
         <TouchableOpacity style={styles.logoutButton} onPress={handleLogout}>
           <Ionicons name="log-out-outline" size={24} color="#EF4444" />
           <Text style={styles.logoutText}>Logout</Text>
@@ -532,7 +504,6 @@ export default function CivilHome() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#0F172A' },
-  scrollContent: { flexGrow: 1 },
   loadingContainer:    { flex: 1, justifyContent: 'center', alignItems: 'center' },
   headerRight:         { flexDirection: 'row', alignItems: 'center', gap: 12 },
   headerAvatar:        { width: 36, height: 36, borderRadius: 18, borderWidth: 2, borderColor: '#3B82F6' },
