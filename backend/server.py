@@ -552,20 +552,28 @@ async def attach_ambient_audio(panic_id: str, request: Request, user = Depends(g
 
 @api_router.post("/panic/deactivate")
 async def deactivate_panic(user = Depends(get_current_user)):
+    user_id_str = str(user["_id"])
+    logger.info(f"[Deactivate] User {user_id_str} requesting panic deactivation")
+
     result = await db.panic_events.update_many(
-        {"user_id": str(user["_id"]), "is_active": True},
+        {"user_id": user_id_str, "is_active": True},
         {"$set": {"is_active": False, "deactivated_at": datetime.utcnow()}}
     )
+
+    logger.info(f"[Deactivate] Deactivated {result.modified_count} panic events for user {user_id_str}")
     return {"ok": True, "deactivated_count": result.modified_count}
 
 @api_router.get("/panic/status")
 async def get_panic_status(user = Depends(get_current_user)):
+    user_id_str = str(user["_id"])
     panic = await db.panic_events.find_one(
-        {"user_id": str(user["_id"]), "is_active": True}
+        {"user_id": user_id_str, "is_active": True}
     )
     if not panic:
+        logger.info(f"[Status] No active panic for user {user_id_str}")
         return {"is_active": False}
-    
+
+    logger.info(f"[Status] Active panic found for user {user_id_str}: panic_id={str(panic['_id'])}")
     return {
         "is_active": True,
         "panic_id": str(panic["_id"]),
