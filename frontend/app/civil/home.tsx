@@ -297,16 +297,52 @@ export default function CivilHome() {
           );
         }
 
-        // Clear all local panic state
+        // Clear all local panic state IMMEDIATELY before updating UI
         await AsyncStorage.multiRemove([
           'panic_active', 'panic_started_at', 'panic_id', 'active_panic',
         ]);
+
+        // Update local state FIRST, then sync with backend
+        setHasActivePanic(false);
 
         // CRITICAL FIX: Tell native service that panic is no longer active
         await setNativePanicActive(false);
         console.log('[CivilHome] Native panic active flag set to FALSE');
 
-        setHasActivePanic(false);
+        // Force re-check with backend to ensure sync
+        // This handles any race conditions where backend state wasn't updated yet
+        if (token) {
+          try {
+            const statusRes = await axios.get(`${BACKEND_URL}/api/panic/status`, {
+              headers: { Authorization: `Bearer ${token}` },
+              timeout: 10000
+            });
+            const backendHasPanic = statusRes.data?.is_active === true;
+            if (backendHasPanic) {
+              // Backend still has active panic - this means deactivate failed silently
+              // Retry deactivate once
+              console.log('[CivilHome] Backend still has panic, retrying deactivate');
+              await axios.post(
+                `${BACKEND_URL}/api/panic/deactivate`,
+                {},
+                { headers: { Authorization: `Bearer ${token}` }, timeout: 15000 }
+              );
+              // Verify after retry
+              const retryRes = await axios.get(`${BACKEND_URL}/api/panic/status`, {
+                headers: { Authorization: `Bearer ${token}` },
+                timeout: 10000
+              });
+              if (retryRes.data?.is_active !== true) {
+                setHasActivePanic(false);
+              }
+            } else {
+              setHasActivePanic(false);
+            }
+          } catch (syncErr) {
+            // Network error - trust local state since we cleared it
+            console.log('[CivilHome] Backend sync check failed, trusting local state');
+          }
+        }
       } catch (err: any) {
         if (err?.response?.status === 401) {
           await clearAuthData();
