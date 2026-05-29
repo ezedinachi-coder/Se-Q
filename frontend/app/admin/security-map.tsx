@@ -38,11 +38,32 @@ export default function AdminSecurityMap() {
 
   useFocusEffect(
     useCallback(() => {
+      // Trigger location refresh for all security agents before loading data
+      triggerLocationRefreshForAll();
       loadData();
       const interval = setInterval(loadData, 20000);
       return () => clearInterval(interval);
     }, [])
   );
+
+  // Auto-refresh all security agent locations when this screen is opened
+  // This ensures the admin map shows fresh locations for all security agents
+  const triggerLocationRefreshForAll = async () => {
+    try {
+      const token = await getAuthToken();
+      if (!token) return;
+
+      // Call the backend to push location refresh requests to all active security agents
+      await axios.post(`${BACKEND_URL}/api/security/refresh-all-locations`, {}, {
+        headers: { Authorization: `Bearer ${token}` },
+        timeout: 10000,
+      });
+      console.log('[AdminSecurityMap] Location refresh triggered for all security agents');
+    } catch (error: any) {
+      // Non-critical - don't block the admin experience if this fails
+      console.warn('[AdminSecurityMap] Failed to trigger location refresh:', error?.message);
+    }
+  };
 
   const loadData = async () => {
     try {
