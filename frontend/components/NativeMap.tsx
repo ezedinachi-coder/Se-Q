@@ -456,7 +456,7 @@ export function NativeMap({
   const html = buildMapHTML({
     lat,
     lng,
-    zoom: Math.max(2, Math.min(zoom, 18)),
+    zoom: Math.max(2, Math.min(zoom, 19)),  // 19 = ~5m satellite resolution
     markers: allMarkers,
     radiusKm: radiusKm ?? 0,
     draggable: !!onMarkerChange,
