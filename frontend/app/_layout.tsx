@@ -496,20 +496,65 @@ function AppContent() {
   }, []);
 
   useEffect(() => {
+    // Configure notification handling - return shouldShowAlert: true for critical notifications
+    // so they show alerts when app is in foreground
     Notifications.setNotificationHandler({
-      handleNotification: async () => ({
-        shouldShowAlert: false,
-        shouldPlaySound: false,
-        shouldSetBadge:  false,
-      }),
+      handleNotification: async (notification) => {
+        const data = notification.request.content.data;
+        const isCritical = data?.type === 'panic' || data?.type === 'chat_message' || data?.type === 'message';
+        return {
+          shouldShowAlert: true,  // Show alerts for all notifications in foreground
+          shouldPlaySound: isCritical,  // Play sound for critical (panic/chat) notifications
+          shouldSetBadge: true,
+        };
+      },
+      handleSuccessSubscription: (notification) => {
+        console.log('[Notifications] Success subscription:', notification);
+      },
+      handleError: (error, notification) => {
+        console.error('[Notifications] Error:', error, notification);
+      },
     });
+
+    // Listen for notifications when app is in foreground
+    // For background/closed state, the OS handles notification delivery with system sound
     const subscription = Notifications.addNotificationReceivedListener((notification) => {
       const data = notification.request.content.data;
+      console.log('[Notifications] Received notification in foreground:', data);
+
       if (data?.type === 'ping') sendPingLocation();
       // Handle location refresh request from security map
       if (data?.type === 'location_refresh') refreshMyLocation();
+
+      // Handle panic alerts - play emergency sound
+      if (data?.type === 'panic') {
+        console.log('[Notifications] Panic alert received - showing emergency');
+      }
+
+      // Handle chat messages
+      if (data?.type === 'chat_message' || data?.type === 'message') {
+        console.log('[Notifications] Chat message received');
+      }
     });
-    return () => subscription.remove();
+
+    // Handle notification interactions (when user taps the notification)
+    const responseSubscription = Notifications.addNotificationResponseReceivedListener((response) => {
+      const data = response.notification.request.content.data;
+      console.log('[Notifications] Notification tapped:', data);
+
+      if (data?.type === 'panic' && data?.panic_id) {
+        // Navigate to panic details
+        router.push('/civil/panic-active');
+      } else if ((data?.type === 'chat_message' || data?.type === 'message') && data?.conversation_id) {
+        // Navigate to chat
+        router.push(`/security/chat/${data.conversation_id}`);
+      }
+    });
+
+    return () => {
+      subscription.remove();
+      responseSubscription.remove();
+    };
   }, [sendPingLocation, refreshMyLocation]);
 
   // ── Render ─────────────────────────────────────────────────────────────────
