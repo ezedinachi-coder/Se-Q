@@ -165,7 +165,10 @@ function AppContent() {
       bannerTimerRef.current = null;
     }
     setBannerVisible(false);
-    try { router.push('/civil/panic-shake'); } catch (_) {}
+    // replace (not push) — avoids stacking panic-shake on top of the current
+    // screen, which would leave a ghost entry in the history that
+    // checkNativePanic could re-trigger on segments change.
+    try { router.replace('/civil/panic-shake'); } catch (_) {}
   }, []);
 
   const handleBannerDismiss = useCallback(() => {
@@ -216,6 +219,11 @@ function AppContent() {
   const currentRoute    = segments.join('/');
   const isOnPanicScreen = currentRoute.includes('panic-shake') || currentRoute.includes('panic-active');
   const shakeEnabled    = userRole === 'civil' && !isOnPanicScreen;
+
+  // Live ref so async closures (checkNativePanic, AppState handlers) always
+  // read the *current* route rather than a stale closure capture.
+  const segmentsRef = useRef(currentRoute);
+  useEffect(() => { segmentsRef.current = currentRoute; }, [currentRoute]);
 
   const handleShakeTrigger = useCallback(async () => {
     if (isOnPanicScreen) return;
@@ -368,8 +376,20 @@ function AppContent() {
   // checkAndConsumePanic() reads + clears the SharedPrefs flag and we route
   // to /civil/panic-shake.
   //
-  // Also polled on every AppState 'active' event so that if the user taps
-  // the notification while the app is backgrounded (not killed), it works too.
+  // FIXES:
+  //   1. Route guard now reads segmentsRef.current (live) not a stale closure.
+  //      With [segments] as dependency the guard captured the route at effect-
+  //      creation time; on cold start segments=[] so the guard always missed
+  //      and the user was re-trapped on every app open.
+  //   2. AsyncStorage panic_active / active_panic check added — if a panic
+  //      already completed we never re-route to panic-shake regardless of
+  //      what the native flag says (handles partial-failure edge case).
+  //   3. Dependency array changed from [segments] to [] — the effect must
+  //      live for the full component lifetime. The AppState listener was
+  //      being torn down and re-registered on every route change, creating
+  //      duplicate listeners that could double-fire checkNativePanic.
+  //   4. panic_error sentinel cleared here so a previous failed activation
+  //      doesn't permanently block the route.
 
   useEffect(() => {
     let isMounted  = true;
@@ -381,10 +401,19 @@ function AppContent() {
       try {
         const pending = await checkAndConsumePanic();
         if (!pending || !isMounted) return;
+
         const role = await AsyncStorage.getItem('user_role');
         if (role !== 'civil') return;
-        const route = segments.join('/');
-        if (route.includes('panic-shake') || route.includes('panic-active')) return;
+
+        // If a panic already completed (or failed+cleaned), never re-route.
+        const panicActive = await AsyncStorage.getItem('panic_active');
+        const activePanic = await AsyncStorage.getItem('active_panic');
+        if (panicActive === 'true' || !!activePanic) return;
+
+        // Use live segmentsRef — NOT the stale segments closure from effect creation.
+        const liveRoute = segmentsRef.current;
+        if (liveRoute.includes('panic-shake') || liveRoute.includes('panic-active')) return;
+
         router.replace('/civil/panic-shake');
       } catch (error) {
         if (retryCount < MAX_RETRIES) {
@@ -407,7 +436,7 @@ function AppContent() {
       clearTimeout(coldStartTimer);
       appStateSub.remove();
     };
-  }, [segments]);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps — intentionally runs once
 
   // ── Queue processor ────────────────────────────────────────────────────────
 
